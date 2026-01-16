@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "DOM",
+      "ES2021"
+    ],
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitThis": true,
+    "strictNullChecks": true,
+    "allowJs": false,
+    "resolveJsonModule": true,
+    "types": [
+      "node",
+      "obsidian"
+    ]
+  },
+  "include": [
+    "src/**/*.ts"
+  ]
+}
+
