@@ -49,6 +49,15 @@ type GraphTodoTask = {
   };
 };
 
+type GraphChecklistItem = {
+  id: string;
+  displayName: string;
+  isChecked: boolean;
+  lastModifiedDateTime?: string;
+};
+
+type DeletionPolicy = "complete" | "delete" | "detach";
+
 interface MicrosoftToDoSettings {
   clientId: string;
   tenantId: string;
@@ -58,7 +67,7 @@ interface MicrosoftToDoSettings {
   accessTokenExpiresAt: number;
   autoSyncEnabled: boolean;
   autoSyncIntervalMinutes: number;
-  deleteRemoteWhenRemoved: boolean;
+  deletionPolicy: DeletionPolicy;
 }
 
 interface FileSyncConfig {
@@ -75,10 +84,22 @@ interface TaskMappingEntry {
   lastKnownGraphLastModified?: string;
 }
 
+interface ChecklistMappingEntry {
+  listId: string;
+  parentGraphTaskId: string;
+  checklistItemId: string;
+  lastSyncedAt: number;
+  lastSyncedLocalHash: string;
+  lastSyncedGraphHash: string;
+  lastSyncedFileMtime: number;
+  lastKnownGraphLastModified?: string;
+}
+
 interface PluginDataModel {
   settings: MicrosoftToDoSettings;
   fileConfigs: Record<string, FileSyncConfig>;
   taskMappings: Record<string, TaskMappingEntry>;
+  checklistMappings: Record<string, ChecklistMappingEntry>;
 }
 
 const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
@@ -90,10 +111,11 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
-  deleteRemoteWhenRemoved: false
+  deletionPolicy: "complete"
 };
 
 const BLOCK_ID_PREFIX = "mtd_";
+const CHECKLIST_BLOCK_ID_PREFIX = "mtdc_";
 
 type ParsedTaskLine = {
   lineIndex: number;
@@ -139,9 +161,30 @@ class GraphClient {
     return onlyActive ? sliced.filter(t => t && t.status !== "completed") : sliced;
   }
 
+  async listChecklistItems(listId: string, taskId: string): Promise<GraphChecklistItem[]> {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`;
+    const response = await this.requestJson<{ value: GraphChecklistItem[] }>("GET", url);
+    return response.value;
+  }
+
+  async createChecklistItem(listId: string, taskId: string, displayName: string, isChecked: boolean): Promise<GraphChecklistItem> {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`;
+    return this.requestJson<GraphChecklistItem>("POST", url, { displayName: sanitizeTitleForGraph(displayName), isChecked });
+  }
+
+  async updateChecklistItem(listId: string, taskId: string, checklistItemId: string, displayName: string, isChecked: boolean): Promise<void> {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems/${encodeURIComponent(checklistItemId)}`;
+    await this.requestJson<void>("PATCH", url, { displayName: sanitizeTitleForGraph(displayName), isChecked });
+  }
+
+  async deleteChecklistItem(listId: string, taskId: string, checklistItemId: string): Promise<void> {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems/${encodeURIComponent(checklistItemId)}`;
+    await this.requestJson<void>("DELETE", url);
+  }
+
   async createTask(listId: string, title: string, completed: boolean, dueDate?: string): Promise<GraphTodoTask> {
     return this.requestJson<GraphTodoTask>("POST", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`, {
-      title,
+      title: sanitizeTitleForGraph(title),
       status: completed ? "completed" : "notStarted",
       ...(dueDate ? { dueDateTime: buildGraphDueDateTime(dueDate) } : {})
     });
@@ -157,11 +200,14 @@ class GraphClient {
   }
 
   async updateTask(listId: string, taskId: string, title: string, completed: boolean, dueDate?: string | null): Promise<void> {
-    await this.requestJson<void>("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, {
-      title,
-      status: completed ? "completed" : "notStarted",
-      dueDateTime: dueDate ? buildGraphDueDateTime(dueDate) : null
-    });
+    const patch: Record<string, unknown> = {
+      title: sanitizeTitleForGraph(title),
+      status: completed ? "completed" : "notStarted"
+    };
+    if (dueDate !== undefined) {
+      patch.dueDateTime = dueDate === null ? null : buildGraphDueDateTime(dueDate);
+    }
+    await this.requestJson<void>("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, patch);
   }
 
   async deleteTask(listId: string, taskId: string): Promise<void> {
@@ -265,6 +311,10 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
 
+    this.addRibbonIcon("refresh-cw", "Obsidian-MicrosoftToDo-Link: Sync current file", () => {
+      this.syncCurrentFileNow();
+    });
+
     this.addCommand({
       id: "sync-current-file-two-way",
       name: "Obsidian-MicrosoftToDo-Link: Sync current file with Microsoft To Do (two-way)",
@@ -335,7 +385,8 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.dataModel = {
       settings: { ...DEFAULT_SETTINGS, ...(migrated.settings || {}) },
       fileConfigs: migrated.fileConfigs || {},
-      taskMappings: migrated.taskMappings || {}
+      taskMappings: migrated.taskMappings || {},
+      checklistMappings: migrated.checklistMappings || {}
     };
     await this.saveDataModel();
   }
@@ -526,11 +577,14 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       return;
     }
     try {
-      await this.syncFileTwoWay(file);
       const added = await this.pullTodoTasksIntoFile(file, listId, false);
+      const childAdded = await this.pullChecklistIntoFile(file, listId);
       await this.syncFileTwoWay(file);
-      if (added > 0) {
-        new Notice(`同步完成（拉取新增 ${added} 条未完成任务）`);
+      if (added + childAdded > 0) {
+        const parts: string[] = [];
+        if (added > 0) parts.push(`新增任务 ${added}`);
+        if (childAdded > 0) parts.push(`新增子任务 ${childAdded}`);
+        new Notice(`同步完成（拉取${parts.join("，")}）`);
       } else {
         new Notice("同步完成");
       }
@@ -568,6 +622,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     await this.getValidAccessToken();
     const remoteTasks = await this.graph.listTasks(listId, 200, true);
     const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map(m => m.graphTaskId));
+    const existingChecklistIds = new Set(Object.values(this.dataModel.checklistMappings).map(m => m.checklistItemId));
 
     const newTasks = remoteTasks.filter(t => t && t.id && !existingGraphIds.has(t.id));
     if (newTasks.length === 0) return 0;
@@ -581,13 +636,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     const fileMtime = file.stat.mtime;
     let added = 0;
     for (const task of newTasks) {
-      const parts = extractDueFromMarkdownTitle((task.title || "").trim());
+      const parts = extractDueFromMarkdownTitle(sanitizeTitleForGraph((task.title || "").trim()));
       const dueDate = extractDueDateFromGraphTask(task) || parts.dueDate;
       const title = parts.title.trim();
       if (!title) continue;
       const completed = graphStatusToCompleted(task.status);
       const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${blockId}`;
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${blockId} -->`;
       lines.push(line);
 
       const mappingKey = buildMappingKey(file.path, blockId);
@@ -603,6 +658,36 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         lastKnownGraphLastModified: task.lastModifiedDateTime
       };
       added++;
+
+      try {
+        const items = await this.graph.listChecklistItems(listId, task.id);
+        for (const item of items) {
+          if (!item?.id || existingChecklistIds.has(item.id)) continue;
+          if (item.isChecked) continue;
+          const displayName = sanitizeTitleForGraph((item.displayName || "").trim());
+          if (!displayName) continue;
+          const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
+          const childLine = `  - [${item.isChecked ? "x" : " "}] ${displayName} <!-- mtd:${childBlockId} -->`;
+          lines.push(childLine);
+          const childKey = buildMappingKey(file.path, childBlockId);
+          const childLocalHash = hashChecklist(displayName, item.isChecked);
+          const childGraphHash = hashChecklist(displayName, item.isChecked);
+          this.dataModel.checklistMappings[childKey] = {
+            listId,
+            parentGraphTaskId: task.id,
+            checklistItemId: item.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: childLocalHash,
+            lastSyncedGraphHash: childGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: item.lastModifiedDateTime
+          };
+          existingChecklistIds.add(item.id);
+          added++;
+        }
+      } catch (error) {
+        console.error(error);
+      }
     }
 
     if (added > 0) {
@@ -612,6 +697,136 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         await this.syncFileTwoWay(file);
       }
     }
+    return added;
+  }
+
+  private async pullChecklistIntoFile(file: TFile, listId: string): Promise<number> {
+    await this.getValidAccessToken();
+    let content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+
+    let tasks = parseMarkdownTasks(lines);
+    if (tasks.length === 0) return 0;
+
+    let changed = false;
+    const ensured = ensureBlockIds(lines, tasks);
+    if (ensured.changed) {
+      changed = true;
+      tasks = ensured.tasks;
+    }
+
+    const tasksByBlockId = new Map<string, ParsedTaskLine>();
+    for (const t of tasks) tasksByBlockId.set(t.blockId, t);
+
+    const parentByBlockId = new Map<string, string | null>();
+    const stack: { indentWidth: number; blockId: string }[] = [];
+    for (const t of tasks) {
+      const width = getIndentWidth(t.indent);
+      while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+      const parent = stack.length > 0 ? stack[stack.length - 1].blockId : null;
+      parentByBlockId.set(t.blockId, parent);
+      stack.push({ indentWidth: width, blockId: t.blockId });
+    }
+
+    const existingChecklistIds = new Set(Object.values(this.dataModel.checklistMappings).map(m => m.checklistItemId));
+    const fileMtime = file.stat.mtime;
+    let added = 0;
+
+    const parents = tasks
+      .filter(t => t.blockId.startsWith(BLOCK_ID_PREFIX))
+      .sort((a, b) => b.lineIndex - a.lineIndex);
+
+    for (const parent of parents) {
+      const mappingKey = buildMappingKey(file.path, parent.blockId);
+      const parentEntry = this.dataModel.taskMappings[mappingKey];
+      if (!parentEntry) continue;
+
+      let remoteItems: GraphChecklistItem[];
+      try {
+        remoteItems = await this.graph.listChecklistItems(parentEntry.listId, parentEntry.graphTaskId);
+      } catch (error) {
+        console.error(error);
+        continue;
+      }
+
+      const localChildren = tasks.filter(t => {
+        if (!t.blockId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) return false;
+        let p = parentByBlockId.get(t.blockId) ?? null;
+        while (p && p.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) p = parentByBlockId.get(p) ?? null;
+        return p === parent.blockId;
+      });
+
+      const localChildTitles = new Set(localChildren.map(c => c.title));
+
+      for (const child of localChildren) {
+        const ck = buildMappingKey(file.path, child.blockId);
+        if (this.dataModel.checklistMappings[ck]) continue;
+        const matches = remoteItems.filter(i => i && i.displayName === child.title);
+        const match = matches.length === 1 ? matches[0] : null;
+        if (!match || existingChecklistIds.has(match.id)) continue;
+        this.dataModel.checklistMappings[ck] = {
+          listId: parentEntry.listId,
+          parentGraphTaskId: parentEntry.graphTaskId,
+          checklistItemId: match.id,
+          lastSyncedAt: Date.now(),
+          lastSyncedLocalHash: hashChecklist(child.title, child.completed),
+          lastSyncedGraphHash: hashChecklist(match.displayName, match.isChecked),
+          lastSyncedFileMtime: fileMtime,
+          lastKnownGraphLastModified: match.lastModifiedDateTime
+        };
+        existingChecklistIds.add(match.id);
+        changed = true;
+      }
+
+      const parentIndentWidth = getIndentWidth(parent.indent);
+      let insertAt = parent.lineIndex + 1;
+      while (insertAt < lines.length) {
+        const line = lines[insertAt];
+        if (line.trim().length === 0) {
+          insertAt++;
+          continue;
+        }
+        const indentMatch = /^(\s*)/.exec(line);
+        const w = getIndentWidth(indentMatch ? indentMatch[1] : "");
+        if (w <= parentIndentWidth) break;
+        insertAt++;
+      }
+
+      const toInsert: string[] = [];
+      for (const item of remoteItems) {
+        if (!item?.id || existingChecklistIds.has(item.id)) continue;
+        if (item.isChecked) continue;
+        const name = sanitizeTitleForGraph((item.displayName || "").trim());
+        if (!name) continue;
+        if (localChildTitles.has(name)) continue;
+        const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
+        toInsert.push(`  - [ ] ${name} <!-- mtd:${childBlockId} -->`);
+        const ck = buildMappingKey(file.path, childBlockId);
+        this.dataModel.checklistMappings[ck] = {
+          listId: parentEntry.listId,
+          parentGraphTaskId: parentEntry.graphTaskId,
+          checklistItemId: item.id,
+          lastSyncedAt: Date.now(),
+          lastSyncedLocalHash: hashChecklist(name, false),
+          lastSyncedGraphHash: hashChecklist(name, item.isChecked),
+          lastSyncedFileMtime: fileMtime,
+          lastKnownGraphLastModified: item.lastModifiedDateTime
+        };
+        existingChecklistIds.add(item.id);
+        added++;
+        changed = true;
+      }
+
+      if (toInsert.length > 0) {
+        lines.splice(insertAt, 0, ...toInsert);
+      }
+    }
+
+    if (changed) {
+      await this.app.vault.modify(file, lines.join("\n"));
+      await this.saveDataModel();
+    }
+
     return added;
   }
 
@@ -640,7 +855,79 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     const lines = content.split(/\r?\n/);
 
     let tasks = parseMarkdownTasks(lines);
-    if (tasks.length === 0) return;
+    const mappingPrefix = `${file.path}::`;
+    if (tasks.length === 0) {
+      const removedMappings = Object.keys(this.dataModel.taskMappings).filter(key => key.startsWith(mappingPrefix));
+      const removedChecklistMappings = Object.keys(this.dataModel.checklistMappings).filter(key => key.startsWith(mappingPrefix));
+
+      const removedTotal = removedMappings.length + removedChecklistMappings.length;
+      if (removedTotal === 0) return;
+
+      if (removedTotal > 20) {
+        for (const key of removedMappings) delete this.dataModel.taskMappings[key];
+        for (const key of removedChecklistMappings) delete this.dataModel.checklistMappings[key];
+        await this.saveDataModel();
+        new Notice("当前文件无任务，已解除绑定（为安全起见未修改云端）");
+        return;
+      }
+
+      if (this.settings.deletionPolicy === "complete") {
+        for (const key of removedMappings) {
+          const entry = this.dataModel.taskMappings[key];
+          try {
+            const remote = await this.graph.getTask(entry.listId, entry.graphTaskId);
+            if (remote) {
+              const parts = extractDueFromMarkdownTitle((remote.title || "").trim());
+              await this.graph.updateTask(entry.listId, entry.graphTaskId, parts.title, true, undefined);
+            }
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.taskMappings[key];
+        }
+
+        for (const key of removedChecklistMappings) {
+          const entry = this.dataModel.checklistMappings[key];
+          try {
+            const items = await this.graph.listChecklistItems(entry.listId, entry.parentGraphTaskId);
+            const remote = items.find(i => i.id === entry.checklistItemId);
+            if (remote) {
+              await this.graph.updateChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId, remote.displayName, true);
+            }
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.checklistMappings[key];
+        }
+      } else if (this.settings.deletionPolicy === "delete") {
+        for (const key of removedMappings) {
+          const entry = this.dataModel.taskMappings[key];
+          try {
+            await this.graph.deleteTask(entry.listId, entry.graphTaskId);
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.taskMappings[key];
+        }
+
+        for (const key of removedChecklistMappings) {
+          const entry = this.dataModel.checklistMappings[key];
+          try {
+            await this.graph.deleteChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId);
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.checklistMappings[key];
+        }
+      } else {
+        for (const key of removedMappings) delete this.dataModel.taskMappings[key];
+        for (const key of removedChecklistMappings) delete this.dataModel.checklistMappings[key];
+      }
+
+      await this.saveDataModel();
+      new Notice("已同步删除策略到云端");
+      return;
+    }
 
     let changed = false;
     const ensured = ensureBlockIds(lines, tasks);
@@ -649,10 +936,173 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       tasks = ensured.tasks;
     }
 
+    const tasksByBlockId = new Map<string, ParsedTaskLine>();
+    for (const t of tasks) {
+      if (t.blockId) tasksByBlockId.set(t.blockId, t);
+    }
+
+    const parentByBlockId = new Map<string, string | null>();
+    const stack: { indentWidth: number; blockId: string }[] = [];
+    for (const t of tasks) {
+      const width = getIndentWidth(t.indent);
+      while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+      const parent = stack.length > 0 ? stack[stack.length - 1].blockId : null;
+      parentByBlockId.set(t.blockId, parent);
+      stack.push({ indentWidth: width, blockId: t.blockId });
+    }
+
     const fileMtime = file.stat.mtime;
     const presentBlockIds = new Set(tasks.map(t => t.blockId));
+    const checklistCache = new Map<string, GraphChecklistItem[]>();
 
     for (const task of tasks) {
+      const parentBlockId = parentByBlockId.get(task.blockId) ?? null;
+      if (parentBlockId) {
+        let currentParentId: string | null = parentBlockId;
+        while (currentParentId && currentParentId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) {
+          currentParentId = parentByBlockId.get(currentParentId) ?? null;
+        }
+        if (!currentParentId) continue;
+        const parentTask = tasksByBlockId.get(currentParentId);
+        if (!parentTask) continue;
+        if (!parentTask.blockId.startsWith(BLOCK_ID_PREFIX)) continue;
+
+        const parentMappingKey = buildMappingKey(file.path, parentTask.blockId);
+        let parentEntry = this.dataModel.taskMappings[parentMappingKey];
+        if (!parentEntry) {
+          const createdParent = await this.graph.createTask(listId, parentTask.title, parentTask.completed, parentTask.dueDate);
+          const graphHash = hashGraphTask(createdParent);
+          const localHash = hashTask(parentTask.title, parentTask.completed, parentTask.dueDate);
+          parentEntry = {
+            listId,
+            graphTaskId: createdParent.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash,
+            lastSyncedGraphHash: graphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: createdParent.lastModifiedDateTime
+          };
+          this.dataModel.taskMappings[parentMappingKey] = parentEntry;
+          changed = true;
+        }
+
+        const mappingKey = buildMappingKey(file.path, task.blockId);
+        const existing = this.dataModel.checklistMappings[mappingKey];
+        const localHash = hashChecklist(task.title, task.completed);
+        const cacheKey = `${parentEntry.listId}::${parentEntry.graphTaskId}`;
+        let items = checklistCache.get(cacheKey);
+        if (!items) {
+          items = await this.graph.listChecklistItems(parentEntry.listId, parentEntry.graphTaskId);
+          checklistCache.set(cacheKey, items);
+        }
+
+        if (!existing || existing.parentGraphTaskId !== parentEntry.graphTaskId || existing.listId !== parentEntry.listId) {
+          const created = await this.graph.createChecklistItem(parentEntry.listId, parentEntry.graphTaskId, task.title, task.completed);
+          const graphHash = hashChecklist(created.displayName, created.isChecked);
+          this.dataModel.checklistMappings[mappingKey] = {
+            listId: parentEntry.listId,
+            parentGraphTaskId: parentEntry.graphTaskId,
+            checklistItemId: created.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash,
+            lastSyncedGraphHash: graphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: created.lastModifiedDateTime
+          };
+          continue;
+        }
+
+        const remote = items.find(i => i.id === existing.checklistItemId) || null;
+        if (!remote) {
+          const created = await this.graph.createChecklistItem(parentEntry.listId, parentEntry.graphTaskId, task.title, task.completed);
+          const graphHash = hashChecklist(created.displayName, created.isChecked);
+          this.dataModel.checklistMappings[mappingKey] = {
+            listId: parentEntry.listId,
+            parentGraphTaskId: parentEntry.graphTaskId,
+            checklistItemId: created.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash,
+            lastSyncedGraphHash: graphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: created.lastModifiedDateTime
+          };
+          checklistCache.set(cacheKey, [...items, created]);
+          continue;
+        }
+
+        const graphHash = hashChecklist(remote.displayName, remote.isChecked);
+        const localChanged = localHash !== existing.lastSyncedLocalHash;
+        const graphChanged = graphHash !== existing.lastSyncedGraphHash;
+
+        if (!localChanged && !graphChanged) {
+          existing.lastKnownGraphLastModified = remote.lastModifiedDateTime;
+          continue;
+        }
+
+        if (localChanged && !graphChanged) {
+          await this.graph.updateChecklistItem(existing.listId, existing.parentGraphTaskId, existing.checklistItemId, task.title, task.completed);
+          const updatedGraphHash = hashChecklist(task.title, task.completed);
+          this.dataModel.checklistMappings[mappingKey] = {
+            ...existing,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash,
+            lastSyncedGraphHash: updatedGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote.lastModifiedDateTime
+          };
+          continue;
+        }
+
+        if (!localChanged && graphChanged) {
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${remote.displayName} ^${task.blockId}`;
+          if (lines[task.lineIndex] !== updatedLine) {
+            lines[task.lineIndex] = updatedLine;
+            changed = true;
+          }
+          const newLocalHash = hashChecklist(remote.displayName, remote.isChecked);
+          this.dataModel.checklistMappings[mappingKey] = {
+            ...existing,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: newLocalHash,
+            lastSyncedGraphHash: graphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote.lastModifiedDateTime
+          };
+          continue;
+        }
+
+        const graphTime = remote.lastModifiedDateTime ? Date.parse(remote.lastModifiedDateTime) : 0;
+        const localTime = fileMtime;
+        if (graphTime > localTime) {
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${remote.displayName} ^${task.blockId}`;
+          if (lines[task.lineIndex] !== updatedLine) {
+            lines[task.lineIndex] = updatedLine;
+            changed = true;
+          }
+          const newLocalHash = hashChecklist(remote.displayName, remote.isChecked);
+          this.dataModel.checklistMappings[mappingKey] = {
+            ...existing,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: newLocalHash,
+            lastSyncedGraphHash: graphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote.lastModifiedDateTime
+          };
+        } else {
+          await this.graph.updateChecklistItem(existing.listId, existing.parentGraphTaskId, existing.checklistItemId, task.title, task.completed);
+          const updatedGraphHash = hashChecklist(task.title, task.completed);
+          this.dataModel.checklistMappings[mappingKey] = {
+            ...existing,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash,
+            lastSyncedGraphHash: updatedGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote.lastModifiedDateTime
+          };
+        }
+        continue;
+      }
+
       const mappingKey = buildMappingKey(file.path, task.blockId);
       const existing = this.dataModel.taskMappings[mappingKey];
       const localHash = hashTask(task.title, task.completed, task.dueDate);
@@ -784,18 +1234,53 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       }
     }
 
-    const mappingPrefix = `${file.path}::`;
     const removedMappings = Object.keys(this.dataModel.taskMappings).filter(key => key.startsWith(mappingPrefix) && !presentBlockIds.has(key.slice(mappingPrefix.length)));
+    const removedChecklistMappings = Object.keys(this.dataModel.checklistMappings).filter(
+      key => key.startsWith(mappingPrefix) && !presentBlockIds.has(key.slice(mappingPrefix.length))
+    );
+
     for (const key of removedMappings) {
       const entry = this.dataModel.taskMappings[key];
-      if (this.settings.deleteRemoteWhenRemoved) {
+      if (this.settings.deletionPolicy === "delete") {
         try {
           await this.graph.deleteTask(entry.listId, entry.graphTaskId);
         } catch (error) {
           console.error(error);
         }
+      } else if (this.settings.deletionPolicy === "complete") {
+        try {
+          const remote = await this.graph.getTask(entry.listId, entry.graphTaskId);
+          if (remote) {
+            const parts = extractDueFromMarkdownTitle((remote.title || "").trim());
+            await this.graph.updateTask(entry.listId, entry.graphTaskId, parts.title, true, undefined);
+          }
+        } catch (error) {
+          console.error(error);
+        }
       }
       delete this.dataModel.taskMappings[key];
+    }
+
+    for (const key of removedChecklistMappings) {
+      const entry = this.dataModel.checklistMappings[key];
+      if (this.settings.deletionPolicy === "delete") {
+        try {
+          await this.graph.deleteChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId);
+        } catch (error) {
+          console.error(error);
+        }
+      } else if (this.settings.deletionPolicy === "complete") {
+        try {
+          const items = await this.graph.listChecklistItems(entry.listId, entry.parentGraphTaskId);
+          const remote = items.find(i => i.id === entry.checklistItemId);
+          if (remote) {
+            await this.graph.updateChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId, remote.displayName, true);
+          }
+        } catch (error) {
+          console.error(error);
+        }
+      }
+      delete this.dataModel.checklistMappings[key];
     }
 
     if (changed) {
@@ -825,17 +1310,24 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
 function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
   if (!raw || typeof raw !== "object") {
-    return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {} };
+    return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {}, checklistMappings: {} };
   }
 
   const obj = raw as Record<string, unknown>;
 
   if ("settings" in obj) {
-    const settings = (obj.settings as MicrosoftToDoSettings) || ({} as MicrosoftToDoSettings);
+    const settings = (obj.settings as any) || {};
+    const deletionPolicy: DeletionPolicy =
+      settings.deletionPolicy === "delete" || settings.deletionPolicy === "detach" || settings.deletionPolicy === "complete"
+        ? settings.deletionPolicy
+        : settings.deleteRemoteWhenRemoved === true
+          ? "delete"
+          : "complete";
     return {
-      settings: { ...DEFAULT_SETTINGS, ...settings },
+      settings: { ...DEFAULT_SETTINGS, ...settings, deletionPolicy },
       fileConfigs: (obj.fileConfigs as Record<string, FileSyncConfig>) || {},
-      taskMappings: (obj.taskMappings as Record<string, TaskMappingEntry>) || {}
+      taskMappings: (obj.taskMappings as Record<string, TaskMappingEntry>) || {},
+      checklistMappings: (obj.checklistMappings as Record<string, ChecklistMappingEntry>) || {}
     };
   }
 
@@ -851,17 +1343,24 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
         refreshToken: legacy.refreshToken || ""
       },
       fileConfigs: {},
-      taskMappings: {}
+      taskMappings: {},
+      checklistMappings: {}
     };
   }
 
-  return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {} };
+  return {
+    settings: { ...DEFAULT_SETTINGS, ...(obj.settings as any) },
+    fileConfigs: (obj.fileConfigs as Record<string, FileSyncConfig>) || {},
+    taskMappings: (obj.taskMappings as Record<string, TaskMappingEntry>) || {},
+    checklistMappings: (obj.checklistMappings as Record<string, ChecklistMappingEntry>) || {}
+  };
 }
 
 function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
   const tasks: ParsedTaskLine[] = [];
   const taskPattern = /^(\s*)([-*])\s+\[([ xX])\]\s+(.*)$/;
-  const blockIdPattern = /\s+\^([a-z0-9_]+)\s*$/i;
+  const blockIdCaretPattern = /\s+\^([a-z0-9_]+)\s*$/i;
+  const blockIdCommentPattern = /\s*<!--\s*mtd\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = taskPattern.exec(line);
@@ -872,14 +1371,19 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
     const rest = (match[4] ?? "").trim();
     if (!rest) continue;
 
-    const blockMatch = blockIdPattern.exec(rest);
-    const existingBlockId = blockMatch ? blockMatch[1] : "";
-    const rawTitle = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    const commentMatch = blockIdCommentPattern.exec(rest);
+    const caretMatch = commentMatch ? null : blockIdCaretPattern.exec(rest);
+    const markerMatch = commentMatch || caretMatch;
+    const existingBlockId = markerMatch ? markerMatch[1] : "";
+    const rawTitle = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
     if (!rawTitle) continue;
     const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
 
-    const blockId = existingBlockId && existingBlockId.startsWith(BLOCK_ID_PREFIX) ? existingBlockId : "";
+    const blockId =
+      existingBlockId && (existingBlockId.startsWith(BLOCK_ID_PREFIX) || existingBlockId.startsWith(CHECKLIST_BLOCK_ID_PREFIX))
+        ? existingBlockId
+        : "";
     tasks.push({
       lineIndex: i,
       indent,
@@ -896,22 +1400,31 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
 function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: ParsedTaskLine[]; changed: boolean } {
   let changed = false;
   const updated: ParsedTaskLine[] = [];
+  const stack: { indentWidth: number }[] = [];
   for (const task of tasks) {
+    const width = getIndentWidth(task.indent);
+    while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+    const isNested = stack.length > 0;
+
     if (task.blockId) {
       updated.push(task);
+      stack.push({ indentWidth: width });
       continue;
     }
-    const newBlockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} ^${newBlockId}`;
+
+    const prefix = isNested ? CHECKLIST_BLOCK_ID_PREFIX : BLOCK_ID_PREFIX;
+    const newBlockId = `${prefix}${randomId(8)}`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} <!-- mtd:${newBlockId} -->`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
+    stack.push({ indentWidth: width });
   }
   return { tasks: updated, changed };
 }
 
 function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean, dueDate?: string): string {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${task.blockId}`;
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${task.blockId} -->`;
 }
 
 function randomId(length: number): string {
@@ -942,8 +1455,28 @@ function hashGraphTask(task: GraphTodoTask): string {
   return hashTask(normalized.title, graphStatusToCompleted(task.status), dueDate);
 }
 
+function hashChecklist(title: string, completed: boolean): string {
+  return `${completed ? "1" : "0"}|${title}`;
+}
+
 function graphStatusToCompleted(status: GraphTodoTask["status"]): boolean {
   return status === "completed";
+}
+
+function getIndentWidth(indent: string): number {
+  const normalized = (indent || "").replace(/\t/g, "  ");
+  return normalized.length;
+}
+
+function sanitizeTitleForGraph(title: string): string {
+  const input = (title || "").trim();
+  if (!input) return "";
+  const withoutIds = input
+    .replace(/\^mtdc?_[a-z0-9_]+/gi, " ")
+    .replace(/<!--\s*mtd\s*:\s*mtdc?_[a-z0-9_]+\s*-->/gi, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return withoutIds;
 }
 
 function buildMarkdownTaskTitle(title: string, dueDate?: string): string {
@@ -1297,40 +1830,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("立即同步")
-      .setDesc("一键执行双向同步：先同步当前文件，再同步已绑定文件")
-      .addButton(btn =>
-        btn.setButtonText("同步当前文件").onClick(async () => {
-          try {
-            await this.plugin.syncCurrentFileTwoWay();
-          } catch (error) {
-            const message = normalizeErrorMessage(error);
-            console.error(error);
-            new Notice(message || "同步失败，详细信息请查看控制台");
-          }
-        })
-      )
-      .addButton(btn =>
-        btn.setButtonText("完整同步（推送+拉取未完成）").onClick(async () => {
-          await this.plugin.syncCurrentFileNow();
-        })
-      )
-      .addButton(btn =>
-        btn.setButtonText("同步已绑定文件").onClick(async () => {
-          try {
-            await this.plugin.syncMappedFilesTwoWay();
-            new Notice("同步完成");
-          } catch (error) {
-            const message = normalizeErrorMessage(error);
-            console.error(error);
-            new Notice(message || "同步失败，详细信息请查看控制台");
-          }
-        })
-      )
-      .addButton(btn =>
-        btn.setButtonText("从 To Do 拉取到当前文件").onClick(async () => {
-          await this.plugin.pullTodoIntoCurrentFile();
-        })
-      );
+      .setDesc("一键执行完整同步（优先拉取 To Do 的未完成任务）")
+      .addButton(btn => btn.setButtonText("同步当前文件").onClick(async () => await this.plugin.syncCurrentFileNow()));
 
     new Setting(containerEl)
       .setName("自动同步")
@@ -1356,14 +1857,20 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("任务从笔记删除时删除云端任务")
-      .setDesc("关闭时仅解除绑定，不会删除 Microsoft To Do 中的任务")
-      .addToggle(toggle =>
-        toggle.setValue(this.plugin.settings.deleteRemoteWhenRemoved).onChange(async value => {
-          this.plugin.settings.deleteRemoteWhenRemoved = value;
-          await this.plugin.saveDataModel();
-        })
-      );
+      .setName("删除策略")
+      .setDesc("从笔记删除已同步任务时，对 Microsoft To Do 的处理方式")
+      .addDropdown(dropdown => {
+        dropdown
+          .addOption("complete", "标记为已完成（推荐）")
+          .addOption("delete", "删除 Microsoft To Do 任务")
+          .addOption("detach", "仅解除绑定（不改云端）")
+          .setValue(this.plugin.settings.deletionPolicy || "complete")
+          .onChange(async value => {
+            const normalized = value === "delete" || value === "detach" ? value : "complete";
+            this.plugin.settings.deletionPolicy = normalized;
+            await this.plugin.saveDataModel();
+          });
+      });
 
     new Setting(containerEl)
       .setName("当前文件列表绑定")

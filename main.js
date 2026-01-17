@@ -35,9 +35,10 @@ var DEFAULT_SETTINGS = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
-  deleteRemoteWhenRemoved: false
+  deletionPolicy: "complete"
 };
 var BLOCK_ID_PREFIX = "mtd_";
+var CHECKLIST_BLOCK_ID_PREFIX = "mtdc_";
 var GraphClient = class {
   constructor(plugin) {
     __publicField(this, "plugin");
@@ -69,9 +70,26 @@ var GraphClient = class {
     const sliced = tasks.slice(0, limit);
     return onlyActive ? sliced.filter((t) => t && t.status !== "completed") : sliced;
   }
+  async listChecklistItems(listId, taskId) {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`;
+    const response = await this.requestJson("GET", url);
+    return response.value;
+  }
+  async createChecklistItem(listId, taskId, displayName, isChecked) {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`;
+    return this.requestJson("POST", url, { displayName: sanitizeTitleForGraph(displayName), isChecked });
+  }
+  async updateChecklistItem(listId, taskId, checklistItemId, displayName, isChecked) {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems/${encodeURIComponent(checklistItemId)}`;
+    await this.requestJson("PATCH", url, { displayName: sanitizeTitleForGraph(displayName), isChecked });
+  }
+  async deleteChecklistItem(listId, taskId, checklistItemId) {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems/${encodeURIComponent(checklistItemId)}`;
+    await this.requestJson("DELETE", url);
+  }
   async createTask(listId, title, completed, dueDate) {
     return this.requestJson("POST", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`, {
-      title,
+      title: sanitizeTitleForGraph(title),
       status: completed ? "completed" : "notStarted",
       ...dueDate ? { dueDateTime: buildGraphDueDateTime(dueDate) } : {}
     });
@@ -85,11 +103,14 @@ var GraphClient = class {
     }
   }
   async updateTask(listId, taskId, title, completed, dueDate) {
-    await this.requestJson("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, {
-      title,
-      status: completed ? "completed" : "notStarted",
-      dueDateTime: dueDate ? buildGraphDueDateTime(dueDate) : null
-    });
+    const patch = {
+      title: sanitizeTitleForGraph(title),
+      status: completed ? "completed" : "notStarted"
+    };
+    if (dueDate !== void 0) {
+      patch.dueDateTime = dueDate === null ? null : buildGraphDueDateTime(dueDate);
+    }
+    await this.requestJson("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, patch);
   }
   async deleteTask(listId, taskId) {
     await this.requestJson("DELETE", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`);
@@ -176,6 +197,9 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
+    this.addRibbonIcon("refresh-cw", "Obsidian-MicrosoftToDo-Link: Sync current file", () => {
+      this.syncCurrentFileNow();
+    });
     this.addCommand({
       id: "sync-current-file-two-way",
       name: "Obsidian-MicrosoftToDo-Link: Sync current file with Microsoft To Do (two-way)",
@@ -236,7 +260,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     this.dataModel = {
       settings: { ...DEFAULT_SETTINGS, ...migrated.settings || {} },
       fileConfigs: migrated.fileConfigs || {},
-      taskMappings: migrated.taskMappings || {}
+      taskMappings: migrated.taskMappings || {},
+      checklistMappings: migrated.checklistMappings || {}
     };
     await this.saveDataModel();
   }
@@ -410,11 +435,14 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       return;
     }
     try {
-      await this.syncFileTwoWay(file);
       const added = await this.pullTodoTasksIntoFile(file, listId, false);
+      const childAdded = await this.pullChecklistIntoFile(file, listId);
       await this.syncFileTwoWay(file);
-      if (added > 0) {
-        new import_obsidian.Notice(`\u540C\u6B65\u5B8C\u6210\uFF08\u62C9\u53D6\u65B0\u589E ${added} \u6761\u672A\u5B8C\u6210\u4EFB\u52A1\uFF09`);
+      if (added + childAdded > 0) {
+        const parts = [];
+        if (added > 0) parts.push(`\u65B0\u589E\u4EFB\u52A1 ${added}`);
+        if (childAdded > 0) parts.push(`\u65B0\u589E\u5B50\u4EFB\u52A1 ${childAdded}`);
+        new import_obsidian.Notice(`\u540C\u6B65\u5B8C\u6210\uFF08\u62C9\u53D6${parts.join("\uFF0C")}\uFF09`);
       } else {
         new import_obsidian.Notice("\u540C\u6B65\u5B8C\u6210");
       }
@@ -450,6 +478,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     await this.getValidAccessToken();
     const remoteTasks = await this.graph.listTasks(listId, 200, true);
     const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map((m) => m.graphTaskId));
+    const existingChecklistIds = new Set(Object.values(this.dataModel.checklistMappings).map((m) => m.checklistItemId));
     const newTasks = remoteTasks.filter((t) => t && t.id && !existingGraphIds.has(t.id));
     if (newTasks.length === 0) return 0;
     let content = await this.app.vault.read(file);
@@ -460,13 +489,13 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     const fileMtime = file.stat.mtime;
     let added = 0;
     for (const task of newTasks) {
-      const parts = extractDueFromMarkdownTitle((task.title || "").trim());
+      const parts = extractDueFromMarkdownTitle(sanitizeTitleForGraph((task.title || "").trim()));
       const dueDate = extractDueDateFromGraphTask(task) || parts.dueDate;
       const title = parts.title.trim();
       if (!title) continue;
       const completed = graphStatusToCompleted(task.status);
       const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${blockId}`;
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${blockId} -->`;
       lines.push(line);
       const mappingKey = buildMappingKey(file.path, blockId);
       const localHash = hashTask(title, completed, dueDate);
@@ -481,6 +510,35 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         lastKnownGraphLastModified: task.lastModifiedDateTime
       };
       added++;
+      try {
+        const items = await this.graph.listChecklistItems(listId, task.id);
+        for (const item of items) {
+          if (!(item == null ? void 0 : item.id) || existingChecklistIds.has(item.id)) continue;
+          if (item.isChecked) continue;
+          const displayName = sanitizeTitleForGraph((item.displayName || "").trim());
+          if (!displayName) continue;
+          const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
+          const childLine = `  - [${item.isChecked ? "x" : " "}] ${displayName} <!-- mtd:${childBlockId} -->`;
+          lines.push(childLine);
+          const childKey = buildMappingKey(file.path, childBlockId);
+          const childLocalHash = hashChecklist(displayName, item.isChecked);
+          const childGraphHash = hashChecklist(displayName, item.isChecked);
+          this.dataModel.checklistMappings[childKey] = {
+            listId,
+            parentGraphTaskId: task.id,
+            checklistItemId: item.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: childLocalHash,
+            lastSyncedGraphHash: childGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: item.lastModifiedDateTime
+          };
+          existingChecklistIds.add(item.id);
+          added++;
+        }
+      } catch (error) {
+        console.error(error);
+      }
     }
     if (added > 0) {
       await this.app.vault.modify(file, lines.join("\n"));
@@ -488,6 +546,118 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       if (syncAfter) {
         await this.syncFileTwoWay(file);
       }
+    }
+    return added;
+  }
+  async pullChecklistIntoFile(file, listId) {
+    await this.getValidAccessToken();
+    let content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    let tasks = parseMarkdownTasks(lines);
+    if (tasks.length === 0) return 0;
+    let changed = false;
+    const ensured = ensureBlockIds(lines, tasks);
+    if (ensured.changed) {
+      changed = true;
+      tasks = ensured.tasks;
+    }
+    const tasksByBlockId = /* @__PURE__ */ new Map();
+    for (const t of tasks) tasksByBlockId.set(t.blockId, t);
+    const parentByBlockId = /* @__PURE__ */ new Map();
+    const stack = [];
+    for (const t of tasks) {
+      const width = getIndentWidth(t.indent);
+      while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+      const parent = stack.length > 0 ? stack[stack.length - 1].blockId : null;
+      parentByBlockId.set(t.blockId, parent);
+      stack.push({ indentWidth: width, blockId: t.blockId });
+    }
+    const existingChecklistIds = new Set(Object.values(this.dataModel.checklistMappings).map((m) => m.checklistItemId));
+    const fileMtime = file.stat.mtime;
+    let added = 0;
+    const parents = tasks.filter((t) => t.blockId.startsWith(BLOCK_ID_PREFIX)).sort((a, b) => b.lineIndex - a.lineIndex);
+    for (const parent of parents) {
+      const mappingKey = buildMappingKey(file.path, parent.blockId);
+      const parentEntry = this.dataModel.taskMappings[mappingKey];
+      if (!parentEntry) continue;
+      let remoteItems;
+      try {
+        remoteItems = await this.graph.listChecklistItems(parentEntry.listId, parentEntry.graphTaskId);
+      } catch (error) {
+        console.error(error);
+        continue;
+      }
+      const localChildren = tasks.filter((t) => {
+        var _a, _b;
+        if (!t.blockId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) return false;
+        let p = (_a = parentByBlockId.get(t.blockId)) != null ? _a : null;
+        while (p && p.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) p = (_b = parentByBlockId.get(p)) != null ? _b : null;
+        return p === parent.blockId;
+      });
+      const localChildTitles = new Set(localChildren.map((c) => c.title));
+      for (const child of localChildren) {
+        const ck = buildMappingKey(file.path, child.blockId);
+        if (this.dataModel.checklistMappings[ck]) continue;
+        const matches = remoteItems.filter((i) => i && i.displayName === child.title);
+        const match = matches.length === 1 ? matches[0] : null;
+        if (!match || existingChecklistIds.has(match.id)) continue;
+        this.dataModel.checklistMappings[ck] = {
+          listId: parentEntry.listId,
+          parentGraphTaskId: parentEntry.graphTaskId,
+          checklistItemId: match.id,
+          lastSyncedAt: Date.now(),
+          lastSyncedLocalHash: hashChecklist(child.title, child.completed),
+          lastSyncedGraphHash: hashChecklist(match.displayName, match.isChecked),
+          lastSyncedFileMtime: fileMtime,
+          lastKnownGraphLastModified: match.lastModifiedDateTime
+        };
+        existingChecklistIds.add(match.id);
+        changed = true;
+      }
+      const parentIndentWidth = getIndentWidth(parent.indent);
+      let insertAt = parent.lineIndex + 1;
+      while (insertAt < lines.length) {
+        const line = lines[insertAt];
+        if (line.trim().length === 0) {
+          insertAt++;
+          continue;
+        }
+        const indentMatch = /^(\s*)/.exec(line);
+        const w = getIndentWidth(indentMatch ? indentMatch[1] : "");
+        if (w <= parentIndentWidth) break;
+        insertAt++;
+      }
+      const toInsert = [];
+      for (const item of remoteItems) {
+        if (!(item == null ? void 0 : item.id) || existingChecklistIds.has(item.id)) continue;
+        if (item.isChecked) continue;
+        const name = sanitizeTitleForGraph((item.displayName || "").trim());
+        if (!name) continue;
+        if (localChildTitles.has(name)) continue;
+        const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
+        toInsert.push(`  - [ ] ${name} <!-- mtd:${childBlockId} -->`);
+        const ck = buildMappingKey(file.path, childBlockId);
+        this.dataModel.checklistMappings[ck] = {
+          listId: parentEntry.listId,
+          parentGraphTaskId: parentEntry.graphTaskId,
+          checklistItemId: item.id,
+          lastSyncedAt: Date.now(),
+          lastSyncedLocalHash: hashChecklist(name, false),
+          lastSyncedGraphHash: hashChecklist(name, item.isChecked),
+          lastSyncedFileMtime: fileMtime,
+          lastKnownGraphLastModified: item.lastModifiedDateTime
+        };
+        existingChecklistIds.add(item.id);
+        added++;
+        changed = true;
+      }
+      if (toInsert.length > 0) {
+        lines.splice(insertAt, 0, ...toInsert);
+      }
+    }
+    if (changed) {
+      await this.app.vault.modify(file, lines.join("\n"));
+      await this.saveDataModel();
     }
     return added;
   }
@@ -505,7 +675,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     }
   }
   async syncFileTwoWay(file) {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e, _f;
     const listId = this.getListIdForFile(file.path);
     if (!listId) {
       new import_obsidian.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u9009\u62E9\u9ED8\u8BA4\u5217\u8868\uFF0C\u6216\u4E3A\u5F53\u524D\u6587\u4EF6\u9009\u62E9\u5217\u8868");
@@ -514,16 +684,233 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
     let tasks = parseMarkdownTasks(lines);
-    if (tasks.length === 0) return;
+    const mappingPrefix = `${file.path}::`;
+    if (tasks.length === 0) {
+      const removedMappings2 = Object.keys(this.dataModel.taskMappings).filter((key) => key.startsWith(mappingPrefix));
+      const removedChecklistMappings2 = Object.keys(this.dataModel.checklistMappings).filter((key) => key.startsWith(mappingPrefix));
+      const removedTotal = removedMappings2.length + removedChecklistMappings2.length;
+      if (removedTotal === 0) return;
+      if (removedTotal > 20) {
+        for (const key of removedMappings2) delete this.dataModel.taskMappings[key];
+        for (const key of removedChecklistMappings2) delete this.dataModel.checklistMappings[key];
+        await this.saveDataModel();
+        new import_obsidian.Notice("\u5F53\u524D\u6587\u4EF6\u65E0\u4EFB\u52A1\uFF0C\u5DF2\u89E3\u9664\u7ED1\u5B9A\uFF08\u4E3A\u5B89\u5168\u8D77\u89C1\u672A\u4FEE\u6539\u4E91\u7AEF\uFF09");
+        return;
+      }
+      if (this.settings.deletionPolicy === "complete") {
+        for (const key of removedMappings2) {
+          const entry = this.dataModel.taskMappings[key];
+          try {
+            const remote = await this.graph.getTask(entry.listId, entry.graphTaskId);
+            if (remote) {
+              const parts = extractDueFromMarkdownTitle((remote.title || "").trim());
+              await this.graph.updateTask(entry.listId, entry.graphTaskId, parts.title, true, void 0);
+            }
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.taskMappings[key];
+        }
+        for (const key of removedChecklistMappings2) {
+          const entry = this.dataModel.checklistMappings[key];
+          try {
+            const items = await this.graph.listChecklistItems(entry.listId, entry.parentGraphTaskId);
+            const remote = items.find((i) => i.id === entry.checklistItemId);
+            if (remote) {
+              await this.graph.updateChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId, remote.displayName, true);
+            }
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.checklistMappings[key];
+        }
+      } else if (this.settings.deletionPolicy === "delete") {
+        for (const key of removedMappings2) {
+          const entry = this.dataModel.taskMappings[key];
+          try {
+            await this.graph.deleteTask(entry.listId, entry.graphTaskId);
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.taskMappings[key];
+        }
+        for (const key of removedChecklistMappings2) {
+          const entry = this.dataModel.checklistMappings[key];
+          try {
+            await this.graph.deleteChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId);
+          } catch (error) {
+            console.error(error);
+          }
+          delete this.dataModel.checklistMappings[key];
+        }
+      } else {
+        for (const key of removedMappings2) delete this.dataModel.taskMappings[key];
+        for (const key of removedChecklistMappings2) delete this.dataModel.checklistMappings[key];
+      }
+      await this.saveDataModel();
+      new import_obsidian.Notice("\u5DF2\u540C\u6B65\u5220\u9664\u7B56\u7565\u5230\u4E91\u7AEF");
+      return;
+    }
     let changed = false;
     const ensured = ensureBlockIds(lines, tasks);
     if (ensured.changed) {
       changed = true;
       tasks = ensured.tasks;
     }
+    const tasksByBlockId = /* @__PURE__ */ new Map();
+    for (const t of tasks) {
+      if (t.blockId) tasksByBlockId.set(t.blockId, t);
+    }
+    const parentByBlockId = /* @__PURE__ */ new Map();
+    const stack = [];
+    for (const t of tasks) {
+      const width = getIndentWidth(t.indent);
+      while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+      const parent = stack.length > 0 ? stack[stack.length - 1].blockId : null;
+      parentByBlockId.set(t.blockId, parent);
+      stack.push({ indentWidth: width, blockId: t.blockId });
+    }
     const fileMtime = file.stat.mtime;
     const presentBlockIds = new Set(tasks.map((t) => t.blockId));
+    const checklistCache = /* @__PURE__ */ new Map();
     for (const task of tasks) {
+      const parentBlockId = (_a = parentByBlockId.get(task.blockId)) != null ? _a : null;
+      if (parentBlockId) {
+        let currentParentId = parentBlockId;
+        while (currentParentId && currentParentId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) {
+          currentParentId = (_b = parentByBlockId.get(currentParentId)) != null ? _b : null;
+        }
+        if (!currentParentId) continue;
+        const parentTask = tasksByBlockId.get(currentParentId);
+        if (!parentTask) continue;
+        if (!parentTask.blockId.startsWith(BLOCK_ID_PREFIX)) continue;
+        const parentMappingKey = buildMappingKey(file.path, parentTask.blockId);
+        let parentEntry = this.dataModel.taskMappings[parentMappingKey];
+        if (!parentEntry) {
+          const createdParent = await this.graph.createTask(listId, parentTask.title, parentTask.completed, parentTask.dueDate);
+          const graphHash3 = hashGraphTask(createdParent);
+          const localHash3 = hashTask(parentTask.title, parentTask.completed, parentTask.dueDate);
+          parentEntry = {
+            listId,
+            graphTaskId: createdParent.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash3,
+            lastSyncedGraphHash: graphHash3,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: createdParent.lastModifiedDateTime
+          };
+          this.dataModel.taskMappings[parentMappingKey] = parentEntry;
+          changed = true;
+        }
+        const mappingKey2 = buildMappingKey(file.path, task.blockId);
+        const existing2 = this.dataModel.checklistMappings[mappingKey2];
+        const localHash2 = hashChecklist(task.title, task.completed);
+        const cacheKey = `${parentEntry.listId}::${parentEntry.graphTaskId}`;
+        let items = checklistCache.get(cacheKey);
+        if (!items) {
+          items = await this.graph.listChecklistItems(parentEntry.listId, parentEntry.graphTaskId);
+          checklistCache.set(cacheKey, items);
+        }
+        if (!existing2 || existing2.parentGraphTaskId !== parentEntry.graphTaskId || existing2.listId !== parentEntry.listId) {
+          const created = await this.graph.createChecklistItem(parentEntry.listId, parentEntry.graphTaskId, task.title, task.completed);
+          const graphHash3 = hashChecklist(created.displayName, created.isChecked);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            listId: parentEntry.listId,
+            parentGraphTaskId: parentEntry.graphTaskId,
+            checklistItemId: created.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash2,
+            lastSyncedGraphHash: graphHash3,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: created.lastModifiedDateTime
+          };
+          continue;
+        }
+        const remote2 = items.find((i) => i.id === existing2.checklistItemId) || null;
+        if (!remote2) {
+          const created = await this.graph.createChecklistItem(parentEntry.listId, parentEntry.graphTaskId, task.title, task.completed);
+          const graphHash3 = hashChecklist(created.displayName, created.isChecked);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            listId: parentEntry.listId,
+            parentGraphTaskId: parentEntry.graphTaskId,
+            checklistItemId: created.id,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash2,
+            lastSyncedGraphHash: graphHash3,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: created.lastModifiedDateTime
+          };
+          checklistCache.set(cacheKey, [...items, created]);
+          continue;
+        }
+        const graphHash2 = hashChecklist(remote2.displayName, remote2.isChecked);
+        const localChanged2 = localHash2 !== existing2.lastSyncedLocalHash;
+        const graphChanged2 = graphHash2 !== existing2.lastSyncedGraphHash;
+        if (!localChanged2 && !graphChanged2) {
+          existing2.lastKnownGraphLastModified = remote2.lastModifiedDateTime;
+          continue;
+        }
+        if (localChanged2 && !graphChanged2) {
+          await this.graph.updateChecklistItem(existing2.listId, existing2.parentGraphTaskId, existing2.checklistItemId, task.title, task.completed);
+          const updatedGraphHash = hashChecklist(task.title, task.completed);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            ...existing2,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash2,
+            lastSyncedGraphHash: updatedGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote2.lastModifiedDateTime
+          };
+          continue;
+        }
+        if (!localChanged2 && graphChanged2) {
+          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${remote2.displayName} ^${task.blockId}`;
+          if (lines[task.lineIndex] !== updatedLine) {
+            lines[task.lineIndex] = updatedLine;
+            changed = true;
+          }
+          const newLocalHash = hashChecklist(remote2.displayName, remote2.isChecked);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            ...existing2,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: newLocalHash,
+            lastSyncedGraphHash: graphHash2,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote2.lastModifiedDateTime
+          };
+          continue;
+        }
+        const graphTime2 = remote2.lastModifiedDateTime ? Date.parse(remote2.lastModifiedDateTime) : 0;
+        const localTime2 = fileMtime;
+        if (graphTime2 > localTime2) {
+          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${remote2.displayName} ^${task.blockId}`;
+          if (lines[task.lineIndex] !== updatedLine) {
+            lines[task.lineIndex] = updatedLine;
+            changed = true;
+          }
+          const newLocalHash = hashChecklist(remote2.displayName, remote2.isChecked);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            ...existing2,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: newLocalHash,
+            lastSyncedGraphHash: graphHash2,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote2.lastModifiedDateTime
+          };
+        } else {
+          await this.graph.updateChecklistItem(existing2.listId, existing2.parentGraphTaskId, existing2.checklistItemId, task.title, task.completed);
+          const updatedGraphHash = hashChecklist(task.title, task.completed);
+          this.dataModel.checklistMappings[mappingKey2] = {
+            ...existing2,
+            lastSyncedAt: Date.now(),
+            lastSyncedLocalHash: localHash2,
+            lastSyncedGraphHash: updatedGraphHash,
+            lastSyncedFileMtime: fileMtime,
+            lastKnownGraphLastModified: remote2.lastModifiedDateTime
+          };
+        }
+        continue;
+      }
       const mappingKey = buildMappingKey(file.path, task.blockId);
       const existing = this.dataModel.taskMappings[mappingKey];
       const localHash = hashTask(task.title, task.completed, task.dueDate);
@@ -579,7 +966,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         continue;
       }
       if (localChanged && !graphChanged) {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_a = task.dueDate) != null ? _a : null);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_c = task.dueDate) != null ? _c : null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -588,7 +975,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastSyncedLocalHash: localHash,
           lastSyncedGraphHash: latestGraphHash,
           lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: (_b = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _b : remote.lastModifiedDateTime
+          lastKnownGraphLastModified: (_d = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _d : remote.lastModifiedDateTime
         };
         continue;
       }
@@ -631,7 +1018,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastKnownGraphLastModified: remote.lastModifiedDateTime
         };
       } else {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_c = task.dueDate) != null ? _c : null);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_e = task.dueDate) != null ? _e : null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -640,22 +1027,55 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastSyncedLocalHash: localHash,
           lastSyncedGraphHash: latestGraphHash,
           lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: (_d = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _d : remote.lastModifiedDateTime
+          lastKnownGraphLastModified: (_f = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _f : remote.lastModifiedDateTime
         };
       }
     }
-    const mappingPrefix = `${file.path}::`;
     const removedMappings = Object.keys(this.dataModel.taskMappings).filter((key) => key.startsWith(mappingPrefix) && !presentBlockIds.has(key.slice(mappingPrefix.length)));
+    const removedChecklistMappings = Object.keys(this.dataModel.checklistMappings).filter(
+      (key) => key.startsWith(mappingPrefix) && !presentBlockIds.has(key.slice(mappingPrefix.length))
+    );
     for (const key of removedMappings) {
       const entry = this.dataModel.taskMappings[key];
-      if (this.settings.deleteRemoteWhenRemoved) {
+      if (this.settings.deletionPolicy === "delete") {
         try {
           await this.graph.deleteTask(entry.listId, entry.graphTaskId);
         } catch (error) {
           console.error(error);
         }
+      } else if (this.settings.deletionPolicy === "complete") {
+        try {
+          const remote = await this.graph.getTask(entry.listId, entry.graphTaskId);
+          if (remote) {
+            const parts = extractDueFromMarkdownTitle((remote.title || "").trim());
+            await this.graph.updateTask(entry.listId, entry.graphTaskId, parts.title, true, void 0);
+          }
+        } catch (error) {
+          console.error(error);
+        }
       }
       delete this.dataModel.taskMappings[key];
+    }
+    for (const key of removedChecklistMappings) {
+      const entry = this.dataModel.checklistMappings[key];
+      if (this.settings.deletionPolicy === "delete") {
+        try {
+          await this.graph.deleteChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId);
+        } catch (error) {
+          console.error(error);
+        }
+      } else if (this.settings.deletionPolicy === "complete") {
+        try {
+          const items = await this.graph.listChecklistItems(entry.listId, entry.parentGraphTaskId);
+          const remote = items.find((i) => i.id === entry.checklistItemId);
+          if (remote) {
+            await this.graph.updateChecklistItem(entry.listId, entry.parentGraphTaskId, entry.checklistItemId, remote.displayName, true);
+          }
+        } catch (error) {
+          console.error(error);
+        }
+      }
+      delete this.dataModel.checklistMappings[key];
     }
     if (changed) {
       content = lines.join("\n");
@@ -681,15 +1101,17 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
 };
 function migrateDataModel(raw) {
   if (!raw || typeof raw !== "object") {
-    return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {} };
+    return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {}, checklistMappings: {} };
   }
   const obj = raw;
   if ("settings" in obj) {
     const settings = obj.settings || {};
+    const deletionPolicy = settings.deletionPolicy === "delete" || settings.deletionPolicy === "detach" || settings.deletionPolicy === "complete" ? settings.deletionPolicy : settings.deleteRemoteWhenRemoved === true ? "delete" : "complete";
     return {
-      settings: { ...DEFAULT_SETTINGS, ...settings },
+      settings: { ...DEFAULT_SETTINGS, ...settings, deletionPolicy },
       fileConfigs: obj.fileConfigs || {},
-      taskMappings: obj.taskMappings || {}
+      taskMappings: obj.taskMappings || {},
+      checklistMappings: obj.checklistMappings || {}
     };
   }
   if ("clientId" in obj || "accessToken" in obj || "todoListId" in obj) {
@@ -704,16 +1126,23 @@ function migrateDataModel(raw) {
         refreshToken: legacy.refreshToken || ""
       },
       fileConfigs: {},
-      taskMappings: {}
+      taskMappings: {},
+      checklistMappings: {}
     };
   }
-  return { settings: { ...DEFAULT_SETTINGS }, fileConfigs: {}, taskMappings: {} };
+  return {
+    settings: { ...DEFAULT_SETTINGS, ...obj.settings },
+    fileConfigs: obj.fileConfigs || {},
+    taskMappings: obj.taskMappings || {},
+    checklistMappings: obj.checklistMappings || {}
+  };
 }
 function parseMarkdownTasks(lines) {
   var _a, _b, _c, _d;
   const tasks = [];
   const taskPattern = /^(\s*)([-*])\s+\[([ xX])\]\s+(.*)$/;
-  const blockIdPattern = /\s+\^([a-z0-9_]+)\s*$/i;
+  const blockIdCaretPattern = /\s+\^([a-z0-9_]+)\s*$/i;
+  const blockIdCommentPattern = /\s*<!--\s*mtd\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = taskPattern.exec(line);
@@ -723,13 +1152,15 @@ function parseMarkdownTasks(lines) {
     const completed = ((_c = match[3]) != null ? _c : " ").toLowerCase() === "x";
     const rest = ((_d = match[4]) != null ? _d : "").trim();
     if (!rest) continue;
-    const blockMatch = blockIdPattern.exec(rest);
-    const existingBlockId = blockMatch ? blockMatch[1] : "";
-    const rawTitle = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    const commentMatch = blockIdCommentPattern.exec(rest);
+    const caretMatch = commentMatch ? null : blockIdCaretPattern.exec(rest);
+    const markerMatch = commentMatch || caretMatch;
+    const existingBlockId = markerMatch ? markerMatch[1] : "";
+    const rawTitle = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
     if (!rawTitle) continue;
     const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
-    const blockId = existingBlockId && existingBlockId.startsWith(BLOCK_ID_PREFIX) ? existingBlockId : "";
+    const blockId = existingBlockId && (existingBlockId.startsWith(BLOCK_ID_PREFIX) || existingBlockId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) ? existingBlockId : "";
     tasks.push({
       lineIndex: i,
       indent,
@@ -745,21 +1176,28 @@ function parseMarkdownTasks(lines) {
 function ensureBlockIds(lines, tasks) {
   let changed = false;
   const updated = [];
+  const stack = [];
   for (const task of tasks) {
+    const width = getIndentWidth(task.indent);
+    while (stack.length > 0 && width <= stack[stack.length - 1].indentWidth) stack.pop();
+    const isNested = stack.length > 0;
     if (task.blockId) {
       updated.push(task);
+      stack.push({ indentWidth: width });
       continue;
     }
-    const newBlockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} ^${newBlockId}`;
+    const prefix = isNested ? CHECKLIST_BLOCK_ID_PREFIX : BLOCK_ID_PREFIX;
+    const newBlockId = `${prefix}${randomId(8)}`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} <!-- mtd:${newBlockId} -->`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
+    stack.push({ indentWidth: width });
   }
   return { tasks: updated, changed };
 }
 function formatTaskLine(task, title, completed, dueDate) {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${task.blockId}`;
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${task.blockId} -->`;
 }
 function randomId(length) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -783,8 +1221,21 @@ function hashGraphTask(task) {
   const dueDate = extractDueDateFromGraphTask(task) || normalized.dueDate;
   return hashTask(normalized.title, graphStatusToCompleted(task.status), dueDate);
 }
+function hashChecklist(title, completed) {
+  return `${completed ? "1" : "0"}|${title}`;
+}
 function graphStatusToCompleted(status) {
   return status === "completed";
+}
+function getIndentWidth(indent) {
+  const normalized = (indent || "").replace(/\t/g, "  ");
+  return normalized.length;
+}
+function sanitizeTitleForGraph(title) {
+  const input = (title || "").trim();
+  if (!input) return "";
+  const withoutIds = input.replace(/\^mtdc?_[a-z0-9_]+/gi, " ").replace(/<!--\s*mtd\s*:\s*mtdc?_[a-z0-9_]+\s*-->/gi, " ").replace(/\s{2,}/g, " ").trim();
+  return withoutIds;
 }
 function buildMarkdownTaskTitle(title, dueDate) {
   const trimmed = (title || "").trim();
@@ -1087,36 +1538,7 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveDataModel();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("\u7ACB\u5373\u540C\u6B65").setDesc("\u4E00\u952E\u6267\u884C\u53CC\u5411\u540C\u6B65\uFF1A\u5148\u540C\u6B65\u5F53\u524D\u6587\u4EF6\uFF0C\u518D\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6").addButton(
-      (btn) => btn.setButtonText("\u540C\u6B65\u5F53\u524D\u6587\u4EF6").onClick(async () => {
-        try {
-          await this.plugin.syncCurrentFileTwoWay();
-        } catch (error) {
-          const message = normalizeErrorMessage(error);
-          console.error(error);
-          new import_obsidian.Notice(message || "\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
-        }
-      })
-    ).addButton(
-      (btn) => btn.setButtonText("\u5B8C\u6574\u540C\u6B65\uFF08\u63A8\u9001+\u62C9\u53D6\u672A\u5B8C\u6210\uFF09").onClick(async () => {
-        await this.plugin.syncCurrentFileNow();
-      })
-    ).addButton(
-      (btn) => btn.setButtonText("\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6").onClick(async () => {
-        try {
-          await this.plugin.syncMappedFilesTwoWay();
-          new import_obsidian.Notice("\u540C\u6B65\u5B8C\u6210");
-        } catch (error) {
-          const message = normalizeErrorMessage(error);
-          console.error(error);
-          new import_obsidian.Notice(message || "\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
-        }
-      })
-    ).addButton(
-      (btn) => btn.setButtonText("\u4ECE To Do \u62C9\u53D6\u5230\u5F53\u524D\u6587\u4EF6").onClick(async () => {
-        await this.plugin.pullTodoIntoCurrentFile();
-      })
-    );
+    new import_obsidian.Setting(containerEl).setName("\u7ACB\u5373\u540C\u6B65").setDesc("\u4E00\u952E\u6267\u884C\u5B8C\u6574\u540C\u6B65\uFF08\u4F18\u5148\u62C9\u53D6 To Do \u7684\u672A\u5B8C\u6210\u4EFB\u52A1\uFF09").addButton((btn) => btn.setButtonText("\u540C\u6B65\u5F53\u524D\u6587\u4EF6").onClick(async () => await this.plugin.syncCurrentFileNow()));
     new import_obsidian.Setting(containerEl).setName("\u81EA\u52A8\u540C\u6B65").setDesc("\u6309\u56FA\u5B9A\u95F4\u9694\u540C\u6B65\u5DF2\u7ED1\u5B9A\u5217\u8868\u7684\u6587\u4EF6").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async (value) => {
         this.plugin.settings.autoSyncEnabled = value;
@@ -1132,12 +1554,13 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         this.plugin.configureAutoSync();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("\u4EFB\u52A1\u4ECE\u7B14\u8BB0\u5220\u9664\u65F6\u5220\u9664\u4E91\u7AEF\u4EFB\u52A1").setDesc("\u5173\u95ED\u65F6\u4EC5\u89E3\u9664\u7ED1\u5B9A\uFF0C\u4E0D\u4F1A\u5220\u9664 Microsoft To Do \u4E2D\u7684\u4EFB\u52A1").addToggle(
-      (toggle) => toggle.setValue(this.plugin.settings.deleteRemoteWhenRemoved).onChange(async (value) => {
-        this.plugin.settings.deleteRemoteWhenRemoved = value;
+    new import_obsidian.Setting(containerEl).setName("\u5220\u9664\u7B56\u7565").setDesc("\u4ECE\u7B14\u8BB0\u5220\u9664\u5DF2\u540C\u6B65\u4EFB\u52A1\u65F6\uFF0C\u5BF9 Microsoft To Do \u7684\u5904\u7406\u65B9\u5F0F").addDropdown((dropdown) => {
+      dropdown.addOption("complete", "\u6807\u8BB0\u4E3A\u5DF2\u5B8C\u6210\uFF08\u63A8\u8350\uFF09").addOption("delete", "\u5220\u9664 Microsoft To Do \u4EFB\u52A1").addOption("detach", "\u4EC5\u89E3\u9664\u7ED1\u5B9A\uFF08\u4E0D\u6539\u4E91\u7AEF\uFF09").setValue(this.plugin.settings.deletionPolicy || "complete").onChange(async (value) => {
+        const normalized = value === "delete" || value === "detach" ? value : "complete";
+        this.plugin.settings.deletionPolicy = normalized;
         await this.plugin.saveDataModel();
-      })
-    );
+      });
+    });
     new import_obsidian.Setting(containerEl).setName("\u5F53\u524D\u6587\u4EF6\u5217\u8868\u7ED1\u5B9A").setDesc("\u4E3A\u5F53\u524D\u6253\u5F00\u7684 Markdown \u6587\u4EF6\u9009\u62E9\u5217\u8868").addButton(
       (btn) => btn.setButtonText("\u4E3A\u5F53\u524D\u6587\u4EF6\u9009\u62E9\u5217\u8868").onClick(async () => {
         await this.plugin.selectListForCurrentFile();
