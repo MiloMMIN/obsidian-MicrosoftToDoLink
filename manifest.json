@@ -3,7 +3,7 @@
   "name": "MicrosoftToDo-Link",
   "version": "0.3.0",
   "minAppVersion": "1.5.0",
-  "description": "Sync Obsidian tasks to Microsoft To Do via Microsoft Graph.",
+  "description": "Sync markdown tasks to Microsoft To Do via Microsoft Graph.",
   "author": "Ming Bill",
   "authorUrl": "",
   "isDesktopOnly": false
