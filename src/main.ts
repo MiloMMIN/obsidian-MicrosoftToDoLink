@@ -17,6 +17,22 @@ type TokenResponse = {
   token_type: string;
 };
 
+type AadErrorResponse = {
+  error: string;
+  error_description?: string;
+  error_codes?: number[];
+  timestamp?: string;
+  trace_id?: string;
+  correlation_id?: string;
+};
+
+type GraphErrorResponse = {
+  error: {
+    code?: string;
+    message?: string;
+  };
+};
+
 type GraphTodoList = {
   id: string;
   displayName: string;
@@ -27,6 +43,10 @@ type GraphTodoTask = {
   title: string;
   status: "notStarted" | "inProgress" | "completed" | "waitingOnOthers" | "deferred";
   lastModifiedDateTime?: string;
+  dueDateTime?: {
+    dateTime: string;
+    timeZone: string;
+  };
 };
 
 interface MicrosoftToDoSettings {
@@ -81,6 +101,7 @@ type ParsedTaskLine = {
   bullet: "-" | "*";
   completed: boolean;
   title: string;
+  dueDate?: string;
   blockId: string;
 };
 
@@ -96,10 +117,33 @@ class GraphClient {
     return response.value;
   }
 
-  async createTask(listId: string, title: string, completed: boolean): Promise<GraphTodoTask> {
+  async listTasks(listId: string, limit = 200, onlyActive = false): Promise<GraphTodoTask[]> {
+    const base = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`;
+    const withFilter = `${base}?$top=50${onlyActive ? `&$filter=status ne 'completed'` : ""}`;
+    let url = withFilter;
+    const tasks: GraphTodoTask[] = [];
+    while (url && tasks.length < limit) {
+      try {
+        const response = await this.requestJson<{ value: GraphTodoTask[]; "@odata.nextLink"?: string }>("GET", url);
+        tasks.push(...response.value);
+        url = response["@odata.nextLink"] ?? "";
+      } catch (error) {
+        if (onlyActive && url === withFilter && error instanceof GraphError && error.status === 400) {
+          url = `${base}?$top=50`;
+          continue;
+        }
+        throw error;
+      }
+    }
+    const sliced = tasks.slice(0, limit);
+    return onlyActive ? sliced.filter(t => t && t.status !== "completed") : sliced;
+  }
+
+  async createTask(listId: string, title: string, completed: boolean, dueDate?: string): Promise<GraphTodoTask> {
     return this.requestJson<GraphTodoTask>("POST", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`, {
       title,
-      status: completed ? "completed" : "notStarted"
+      status: completed ? "completed" : "notStarted",
+      ...(dueDate ? { dueDateTime: buildGraphDueDateTime(dueDate) } : {})
     });
   }
 
@@ -112,10 +156,11 @@ class GraphClient {
     }
   }
 
-  async updateTask(listId: string, taskId: string, title: string, completed: boolean): Promise<void> {
+  async updateTask(listId: string, taskId: string, title: string, completed: boolean, dueDate?: string | null): Promise<void> {
     await this.requestJson<void>("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, {
       title,
-      status: completed ? "completed" : "notStarted"
+      status: completed ? "completed" : "notStarted",
+      dueDateTime: dueDate ? buildGraphDueDateTime(dueDate) : null
     });
   }
 
@@ -127,7 +172,7 @@ class GraphClient {
     const token = await this.plugin.getValidAccessToken(forceRefresh);
     if (!token) throw new Error("未完成认证");
 
-    const response = await requestUrl({
+    const response = await requestUrlNoThrow({
       url,
       method,
       headers: {
@@ -142,7 +187,7 @@ class GraphClient {
     }
 
     if (response.status >= 400) {
-      const message = typeof response.text === "string" && response.text.trim().length > 0 ? response.text : `Graph 请求失败，状态码 ${response.status}`;
+      const message = formatGraphFailure(url, response.status, response.json as unknown, response.text);
       throw new GraphError(response.status, message);
     }
 
@@ -213,6 +258,8 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   graph!: GraphClient;
   private todoListsCache: GraphTodoList[] = [];
   private autoSyncTimerId: number | null = null;
+  private loginInProgress = false;
+  pendingDeviceCode: { userCode: string; verificationUri: string; expiresAt: number } | null = null;
 
   async onload() {
     await this.loadDataModel();
@@ -247,6 +294,22 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       name: "Obsidian-MicrosoftToDo-Link: Clear sync state for current file",
       callback: () => {
         this.clearSyncStateForCurrentFile();
+      }
+    });
+
+    this.addCommand({
+      id: "pull-todo-into-current-file",
+      name: "Obsidian-MicrosoftToDo-Link: Pull Microsoft To Do tasks into current file",
+      callback: () => {
+        this.pullTodoIntoCurrentFile();
+      }
+    });
+
+    this.addCommand({
+      id: "sync-current-file-full",
+      name: "Obsidian-MicrosoftToDo-Link: Sync current file now (push + pull active)",
+      callback: () => {
+        this.syncCurrentFileNow();
       }
     });
 
@@ -303,13 +366,66 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     const tenant = this.settings.tenantId || "common";
     const device = await createDeviceCode(this.settings.clientId, tenant);
     const message = device.message || `在浏览器中访问 ${device.verification_uri} 并输入代码 ${device.user_code}`;
-    new Notice(message, device.expires_in * 1000);
+    new Notice(message, Number.isFinite(device.expires_in) ? device.expires_in * 1000 : 10_000);
     const token = await pollForToken(device, this.settings.clientId, tenant);
     this.settings.accessToken = token.access_token;
     this.settings.accessTokenExpiresAt = now + Math.max(0, token.expires_in - 60) * 1000;
     if (token.refresh_token) this.settings.refreshToken = token.refresh_token;
     await this.saveDataModel();
     return token.access_token;
+  }
+
+  isLoggedIn(): boolean {
+    const now = Date.now();
+    const tokenValid = Boolean(this.settings.accessToken) && this.settings.accessTokenExpiresAt > now + 60_000;
+    const canRefresh = Boolean(this.settings.refreshToken);
+    return tokenValid || canRefresh;
+  }
+
+  async logout(): Promise<void> {
+    this.settings.accessToken = "";
+    this.settings.refreshToken = "";
+    this.settings.accessTokenExpiresAt = 0;
+    this.pendingDeviceCode = null;
+    await this.saveDataModel();
+  }
+
+  async startInteractiveLogin(onUpdate?: () => void): Promise<void> {
+    if (this.loginInProgress) return;
+    if (!this.settings.clientId) {
+      new Notice("请先填写 Azure 应用 Client ID");
+      return;
+    }
+
+    this.loginInProgress = true;
+    try {
+      await this.logout();
+      const tenant = this.settings.tenantId || "common";
+      const device = await createDeviceCode(this.settings.clientId, tenant);
+      this.pendingDeviceCode = {
+        userCode: device.user_code,
+        verificationUri: device.verification_uri,
+        expiresAt: Date.now() + Math.max(1, device.expires_in) * 1000
+      };
+      onUpdate?.();
+
+      try {
+        window.open(device.verification_uri, "_blank");
+      } catch (_) {}
+
+      new Notice(device.message || `在浏览器中访问 ${device.verification_uri} 并输入代码 ${device.user_code}`, Math.max(10_000, Math.min(60_000, device.expires_in * 1000)));
+
+      const token = await pollForToken(device, this.settings.clientId, tenant);
+      this.settings.accessToken = token.access_token;
+      this.settings.accessTokenExpiresAt = Date.now() + Math.max(0, token.expires_in - 60) * 1000;
+      if (token.refresh_token) this.settings.refreshToken = token.refresh_token;
+      this.pendingDeviceCode = null;
+      await this.saveDataModel();
+      onUpdate?.();
+      new Notice("已登录");
+    } finally {
+      this.loginInProgress = false;
+    }
   }
 
   async fetchTodoLists(force = false): Promise<GraphTodoList[]> {
@@ -398,6 +514,107 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     }
   }
 
+  async syncCurrentFileNow() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("未找到当前活动的 Markdown 文件");
+      return;
+    }
+    const listId = this.getListIdForFile(file.path);
+    if (!listId) {
+      new Notice("请先在设置中选择默认列表，或为当前文件选择列表");
+      return;
+    }
+    try {
+      await this.syncFileTwoWay(file);
+      const added = await this.pullTodoTasksIntoFile(file, listId, false);
+      await this.syncFileTwoWay(file);
+      if (added > 0) {
+        new Notice(`同步完成（拉取新增 ${added} 条未完成任务）`);
+      } else {
+        new Notice("同步完成");
+      }
+    } catch (error) {
+      console.error(error);
+      new Notice(normalizeErrorMessage(error) || "同步失败，详细信息请查看控制台");
+    }
+  }
+
+  async pullTodoIntoCurrentFile() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("未找到当前活动的 Markdown 文件");
+      return;
+    }
+    const listId = this.getListIdForFile(file.path);
+    if (!listId) {
+      new Notice("请先在设置中选择默认列表，或为当前文件选择列表");
+      return;
+    }
+    try {
+      const added = await this.pullTodoTasksIntoFile(file, listId, true);
+      if (added === 0) {
+        new Notice("没有可拉取的新任务");
+      } else {
+        new Notice(`已拉取 ${added} 条任务到当前文件`);
+      }
+    } catch (error) {
+      console.error(error);
+      new Notice(normalizeErrorMessage(error) || "拉取失败，详细信息请查看控制台");
+    }
+  }
+
+  private async pullTodoTasksIntoFile(file: TFile, listId: string, syncAfter: boolean): Promise<number> {
+    await this.getValidAccessToken();
+    const remoteTasks = await this.graph.listTasks(listId, 200, true);
+    const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map(m => m.graphTaskId));
+
+    const newTasks = remoteTasks.filter(t => t && t.id && !existingGraphIds.has(t.id));
+    if (newTasks.length === 0) return 0;
+
+    let content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const hadTrailingBlank = lines.length > 0 && lines[lines.length - 1].trim().length === 0;
+    if (!hadTrailingBlank) lines.push("");
+    lines.push("");
+
+    const fileMtime = file.stat.mtime;
+    let added = 0;
+    for (const task of newTasks) {
+      const parts = extractDueFromMarkdownTitle((task.title || "").trim());
+      const dueDate = extractDueDateFromGraphTask(task) || parts.dueDate;
+      const title = parts.title.trim();
+      if (!title) continue;
+      const completed = graphStatusToCompleted(task.status);
+      const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${blockId}`;
+      lines.push(line);
+
+      const mappingKey = buildMappingKey(file.path, blockId);
+      const localHash = hashTask(title, completed, dueDate);
+      const graphHash = hashGraphTask(task);
+      this.dataModel.taskMappings[mappingKey] = {
+        listId,
+        graphTaskId: task.id,
+        lastSyncedAt: Date.now(),
+        lastSyncedLocalHash: localHash,
+        lastSyncedGraphHash: graphHash,
+        lastSyncedFileMtime: fileMtime,
+        lastKnownGraphLastModified: task.lastModifiedDateTime
+      };
+      added++;
+    }
+
+    if (added > 0) {
+      await this.app.vault.modify(file, lines.join("\n"));
+      await this.saveDataModel();
+      if (syncAfter) {
+        await this.syncFileTwoWay(file);
+      }
+    }
+    return added;
+  }
+
   async syncMappedFilesTwoWay() {
     const filePaths = Object.keys(this.dataModel.fileConfigs);
     if (filePaths.length === 0) return;
@@ -438,10 +655,10 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     for (const task of tasks) {
       const mappingKey = buildMappingKey(file.path, task.blockId);
       const existing = this.dataModel.taskMappings[mappingKey];
-      const localHash = hashTask(task.title, task.completed);
+      const localHash = hashTask(task.title, task.completed, task.dueDate);
 
       if (!existing) {
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -456,7 +673,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       }
 
       if (existing.listId !== listId) {
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -473,7 +690,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const remote = await this.graph.getTask(existing.listId, existing.graphTaskId);
       if (!remote) {
         delete this.dataModel.taskMappings[mappingKey];
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -498,7 +715,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       }
 
       if (localChanged && !graphChanged) {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, task.dueDate ?? null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -513,12 +730,14 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       }
 
       if (!localChanged && graphChanged) {
-        const updatedLine = formatTaskLine(task, remote.title, graphStatusToCompleted(remote.status));
+        const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
+        const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
         }
-        const newLocalHash = hashTask(remote.title, graphStatusToCompleted(remote.status));
+        const newLocalHash = hashTask(remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         this.dataModel.taskMappings[mappingKey] = {
           ...existing,
           lastSyncedAt: Date.now(),
@@ -534,12 +753,14 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const localTime = fileMtime;
 
       if (graphTime > localTime) {
-        const updatedLine = formatTaskLine(task, remote.title, graphStatusToCompleted(remote.status));
+        const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
+        const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
         }
-        const newLocalHash = hashTask(remote.title, graphStatusToCompleted(remote.status));
+        const newLocalHash = hashTask(remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         this.dataModel.taskMappings[mappingKey] = {
           ...existing,
           lastSyncedAt: Date.now(),
@@ -549,7 +770,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           lastKnownGraphLastModified: remote.lastModifiedDateTime
         };
       } else {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, task.dueDate ?? null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -653,7 +874,9 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
 
     const blockMatch = blockIdPattern.exec(rest);
     const existingBlockId = blockMatch ? blockMatch[1] : "";
-    const title = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    const rawTitle = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    if (!rawTitle) continue;
+    const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
 
     const blockId = existingBlockId && existingBlockId.startsWith(BLOCK_ID_PREFIX) ? existingBlockId : "";
@@ -663,6 +886,7 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
       bullet,
       completed,
       title,
+      dueDate,
       blockId
     });
   }
@@ -678,7 +902,7 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
       continue;
     }
     const newBlockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${task.title} ^${newBlockId}`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} ^${newBlockId}`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
@@ -686,8 +910,8 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
   return { tasks: updated, changed };
 }
 
-function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean): string {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${title} ^${task.blockId}`;
+function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean, dueDate?: string): string {
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${task.blockId}`;
 }
 
 function randomId(length: number): string {
@@ -708,16 +932,59 @@ function buildMappingKey(filePath: string, blockId: string): string {
   return `${filePath}::${blockId}`;
 }
 
-function hashTask(title: string, completed: boolean): string {
-  return `${completed ? "1" : "0"}|${title}`;
+function hashTask(title: string, completed: boolean, dueDate?: string): string {
+  return `${completed ? "1" : "0"}|${title}|${dueDate || ""}`;
 }
 
 function hashGraphTask(task: GraphTodoTask): string {
-  return hashTask(task.title, graphStatusToCompleted(task.status));
+  const normalized = extractDueFromMarkdownTitle(task.title || "");
+  const dueDate = extractDueDateFromGraphTask(task) || normalized.dueDate;
+  return hashTask(normalized.title, graphStatusToCompleted(task.status), dueDate);
 }
 
 function graphStatusToCompleted(status: GraphTodoTask["status"]): boolean {
   return status === "completed";
+}
+
+function buildMarkdownTaskTitle(title: string, dueDate?: string): string {
+  const trimmed = (title || "").trim();
+  if (!trimmed) return trimmed;
+  if (!dueDate) return trimmed;
+  return `${trimmed} 📅 ${dueDate}`;
+}
+
+function extractDueFromMarkdownTitle(rawTitle: string): { title: string; dueDate?: string } {
+  const input = (rawTitle || "").trim();
+  if (!input) return { title: "" };
+  const duePattern = /(?:^|\s)📅\s*(\d{4}-\d{2}-\d{2})(?=\s|$)/g;
+  let dueDate: string | undefined;
+  let cleaned = input;
+  let match: RegExpExecArray | null;
+  while ((match = duePattern.exec(input)) !== null) {
+    dueDate = match[1];
+  }
+  cleaned = cleaned.replace(duePattern, " ").replace(/\s{2,}/g, " ").trim();
+  return { title: cleaned, dueDate };
+}
+
+function extractDueDateFromGraphTask(task: GraphTodoTask): string | undefined {
+  const dt = task.dueDateTime?.dateTime;
+  if (typeof dt === "string" && dt.length >= 10) return dt.slice(0, 10);
+  return undefined;
+}
+
+function buildGraphDueDateTime(dueDate: string): { dateTime: string; timeZone: string } {
+  const timeZone = getLocalTimeZone();
+  return { dateTime: `${dueDate}T00:00:00`, timeZone };
+}
+
+function getLocalTimeZone(): string {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof tz === "string" && tz.trim().length > 0 ? tz : "UTC";
+  } catch (_) {
+    return "UTC";
+  }
 }
 
 async function createDeviceCode(clientId: string, tenantId: string): Promise<DeviceCodeResponse> {
@@ -726,7 +993,7 @@ async function createDeviceCode(clientId: string, tenantId: string): Promise<Dev
     client_id: clientId,
     scope: "Tasks.ReadWrite offline_access"
   }).toString();
-  const response = await requestUrl({
+  const response = await requestUrlNoThrow({
     url,
     method: "POST",
     headers: {
@@ -734,7 +1001,18 @@ async function createDeviceCode(clientId: string, tenantId: string): Promise<Dev
     },
     body
   });
-  return response.json as DeviceCodeResponse;
+  const json = response.json as unknown;
+  if (response.status >= 400) {
+    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+  }
+  if (isAadErrorResponse(json)) {
+    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+  }
+  const device = json as DeviceCodeResponse;
+  if (!device.device_code || !device.user_code || !device.verification_uri) {
+    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+  }
+  return device;
 }
 
 async function pollForToken(device: DeviceCodeResponse, clientId: string, tenantId: string): Promise<TokenResponse> {
@@ -747,7 +1025,7 @@ async function pollForToken(device: DeviceCodeResponse, clientId: string, tenant
   const interval = device.interval || 5;
   const maxAttempts = Math.ceil(device.expires_in / interval);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const response = await requestUrl({
+    const response = await requestUrlNoThrow({
       url,
       method: "POST",
       headers: {
@@ -758,8 +1036,10 @@ async function pollForToken(device: DeviceCodeResponse, clientId: string, tenant
     if (response.status === 200) {
       return response.json as TokenResponse;
     }
-    const data = response.json as { error?: string };
-    if (!data.error) throw new Error("未经预期的令牌响应");
+    const data = response.json as unknown;
+    if (!isAadErrorResponse(data)) {
+      throw new Error(formatAadFailure("获取访问令牌失败", data, response.status, response.text));
+    }
     if (data.error === "authorization_pending") {
       await delay(interval * 1000);
       continue;
@@ -768,7 +1048,7 @@ async function pollForToken(device: DeviceCodeResponse, clientId: string, tenant
       await delay((interval + 5) * 1000);
       continue;
     }
-    throw new Error(data.error);
+    throw new Error(formatAadFailure("获取访问令牌失败", data, response.status, response.text));
   }
   throw new Error("设备代码在授权完成前已过期");
 }
@@ -781,7 +1061,7 @@ async function refreshAccessToken(clientId: string, tenantId: string, refreshTok
     refresh_token: refreshToken,
     scope: "Tasks.ReadWrite offline_access"
   }).toString();
-  const response = await requestUrl({
+  const response = await requestUrlNoThrow({
     url,
     method: "POST",
     headers: {
@@ -790,14 +1070,97 @@ async function refreshAccessToken(clientId: string, tenantId: string, refreshTok
     body
   });
   if (response.status >= 400) {
-    const message = typeof response.text === "string" ? response.text : `刷新令牌失败，状态码 ${response.status}`;
-    throw new Error(message);
+    const json = response.json as unknown;
+    throw new Error(formatAadFailure("刷新令牌失败", json, response.status, response.text));
   }
   return response.json as TokenResponse;
 }
 
 async function delay(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isAadErrorResponse(value: unknown): value is AadErrorResponse {
+  if (!value || typeof value !== "object") return false;
+  const obj = value as Record<string, unknown>;
+  return typeof obj.error === "string";
+}
+
+function isGraphErrorResponse(value: unknown): value is GraphErrorResponse {
+  if (!value || typeof value !== "object") return false;
+  const obj = value as Record<string, unknown>;
+  if (!obj.error || typeof obj.error !== "object") return false;
+  return true;
+}
+
+function formatGraphFailure(url: string, status: number, json: unknown, rawText?: string): string {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (isGraphErrorResponse(json)) {
+    const code = typeof json.error.code === "string" ? json.error.code.trim() : "";
+    const msg = typeof json.error.message === "string" ? json.error.message.trim() : "";
+    const parts = [
+      "Graph 请求失败",
+      `HTTP ${status}`,
+      code ? `错误：${code}` : "",
+      msg ? `说明：${msg}` : "",
+      `接口：${url}`
+    ].filter(Boolean);
+    return parts.join("\n");
+  }
+  if (text) return `Graph 请求失败\nHTTP ${status}\n${text}\n接口：${url}`;
+  return `Graph 请求失败（HTTP ${status}）\n接口：${url}`;
+}
+
+function formatAadFailure(prefix: string, json: unknown, status?: number, rawText?: string): string {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (isAadErrorResponse(json)) {
+    const desc = (json.error_description || "").trim();
+    const hint = buildAadHint(json.error, desc);
+    const parts = [
+      prefix,
+      status ? `HTTP ${status}` : "",
+      json.error ? `错误：${json.error}` : "",
+      desc ? `说明：${desc}` : "",
+      hint ? `建议：${hint}` : ""
+    ].filter(Boolean);
+    return parts.join("\n");
+  }
+  if (text) return `${prefix}\nHTTP ${status ?? ""}\n${text}`.trim();
+  return `${prefix}${status ? `（HTTP ${status}）` : ""}`;
+}
+
+function buildAadHint(code: string, description: string): string {
+  const merged = `${code} ${description}`.toLowerCase();
+  if (merged.includes("unauthorized_client") || merged.includes("public client") || merged.includes("7000218")) {
+    return "请在 Azure 应用注册 -> Authentication -> Advanced settings 中启用 Allow public client flows";
+  }
+  if (merged.includes("invalid_scope")) {
+    return "请确认已添加 Microsoft Graph 委托权限 Tasks.ReadWrite 与 offline_access，并重新同意授权";
+  }
+  if (merged.includes("interaction_required")) {
+    return "请重新执行登录/重新登录并在浏览器完成授权";
+  }
+  return "";
+}
+
+function normalizeErrorMessage(error: unknown): string {
+  if (error instanceof GraphError) return error.message;
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "";
+}
+
+async function requestUrlNoThrow(params: { url: string; method?: string; headers?: Record<string, string>; body?: string }): Promise<{
+  status: number;
+  text: string;
+  json: unknown;
+}> {
+  const response = await requestUrl({ ...(params as any), throw: false } as any);
+  return {
+    status: response.status,
+    text: (response.text ?? "") as string,
+    json: response.json as unknown
+  };
 }
 
 class MicrosoftToDoSettingTab extends PluginSettingTab {
@@ -839,6 +1202,74 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           })
       );
 
+    const loginSetting = new Setting(containerEl).setName("账号状态");
+    const statusEl = loginSetting.descEl.createDiv();
+    statusEl.style.marginTop = "6px";
+    const now = Date.now();
+    const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 60_000;
+    const canRefresh = Boolean(this.plugin.settings.refreshToken);
+    if (tokenValid) {
+      statusEl.setText("已登录");
+    } else if (canRefresh) {
+      statusEl.setText("已保存授权（将自动刷新令牌）");
+    } else {
+      statusEl.setText("未登录");
+    }
+
+    const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
+    if (pending) {
+      new Setting(containerEl)
+        .setName("设备登录代码")
+        .setDesc("复制代码到网页登录页面")
+        .addText(text => {
+          text.setValue(pending.userCode);
+          text.inputEl.readOnly = true;
+        })
+        .addButton(btn =>
+          btn.setButtonText("复制代码").onClick(async () => {
+            try {
+              await navigator.clipboard.writeText(pending.userCode);
+              new Notice("已复制");
+            } catch (error) {
+              console.error(error);
+              new Notice("复制失败");
+            }
+          })
+        )
+        .addButton(btn =>
+          btn.setButtonText("打开登录网页").onClick(() => {
+            try {
+              window.open(pending.verificationUri, "_blank");
+            } catch (error) {
+              console.error(error);
+              new Notice("无法打开浏览器");
+            }
+          })
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("登录/退出")
+      .setDesc("登录将自动打开网页登录页面；退出会清除本地令牌")
+      .addButton(btn =>
+        btn.setButtonText(this.plugin.isLoggedIn() ? "退出登录" : "登录").onClick(async () => {
+          try {
+            if (this.plugin.isLoggedIn()) {
+              await this.plugin.logout();
+              new Notice("已退出登录");
+              this.display();
+              return;
+            }
+            await this.plugin.startInteractiveLogin(() => this.display());
+          } catch (error) {
+            const message = normalizeErrorMessage(error);
+            console.error(error);
+            new Notice(message || "登录失败，详细信息请查看控制台");
+            this.display();
+          }
+        })
+      );
+
     new Setting(containerEl)
       .setName("默认 Microsoft To Do 列表")
       .setDesc("未单独配置的文件将使用该列表")
@@ -848,8 +1279,9 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
             await this.plugin.selectDefaultListWithUi();
             this.display();
           } catch (error) {
+            const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice("加载列表失败，详细信息请查看控制台");
+            new Notice(message || "加载列表失败，详细信息请查看控制台");
           }
         })
       )
@@ -861,6 +1293,43 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
             this.plugin.settings.defaultListId = value.trim();
             await this.plugin.saveDataModel();
           })
+      );
+
+    new Setting(containerEl)
+      .setName("立即同步")
+      .setDesc("一键执行双向同步：先同步当前文件，再同步已绑定文件")
+      .addButton(btn =>
+        btn.setButtonText("同步当前文件").onClick(async () => {
+          try {
+            await this.plugin.syncCurrentFileTwoWay();
+          } catch (error) {
+            const message = normalizeErrorMessage(error);
+            console.error(error);
+            new Notice(message || "同步失败，详细信息请查看控制台");
+          }
+        })
+      )
+      .addButton(btn =>
+        btn.setButtonText("完整同步（推送+拉取未完成）").onClick(async () => {
+          await this.plugin.syncCurrentFileNow();
+        })
+      )
+      .addButton(btn =>
+        btn.setButtonText("同步已绑定文件").onClick(async () => {
+          try {
+            await this.plugin.syncMappedFilesTwoWay();
+            new Notice("同步完成");
+          } catch (error) {
+            const message = normalizeErrorMessage(error);
+            console.error(error);
+            new Notice(message || "同步失败，详细信息请查看控制台");
+          }
+        })
+      )
+      .addButton(btn =>
+        btn.setButtonText("从 To Do 拉取到当前文件").onClick(async () => {
+          await this.plugin.pullTodoIntoCurrentFile();
+        })
       );
 
     new Setting(containerEl)

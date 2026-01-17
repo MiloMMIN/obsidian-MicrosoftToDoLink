@@ -47,10 +47,33 @@ var GraphClient = class {
     const response = await this.requestJson("GET", "https://graph.microsoft.com/v1.0/me/todo/lists");
     return response.value;
   }
-  async createTask(listId, title, completed) {
+  async listTasks(listId, limit = 200, onlyActive = false) {
+    var _a;
+    const base = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`;
+    const withFilter = `${base}?$top=50${onlyActive ? `&$filter=status ne 'completed'` : ""}`;
+    let url = withFilter;
+    const tasks = [];
+    while (url && tasks.length < limit) {
+      try {
+        const response = await this.requestJson("GET", url);
+        tasks.push(...response.value);
+        url = (_a = response["@odata.nextLink"]) != null ? _a : "";
+      } catch (error) {
+        if (onlyActive && url === withFilter && error instanceof GraphError && error.status === 400) {
+          url = `${base}?$top=50`;
+          continue;
+        }
+        throw error;
+      }
+    }
+    const sliced = tasks.slice(0, limit);
+    return onlyActive ? sliced.filter((t) => t && t.status !== "completed") : sliced;
+  }
+  async createTask(listId, title, completed, dueDate) {
     return this.requestJson("POST", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`, {
       title,
-      status: completed ? "completed" : "notStarted"
+      status: completed ? "completed" : "notStarted",
+      ...dueDate ? { dueDateTime: buildGraphDueDateTime(dueDate) } : {}
     });
   }
   async getTask(listId, taskId) {
@@ -61,10 +84,11 @@ var GraphClient = class {
       throw error;
     }
   }
-  async updateTask(listId, taskId, title, completed) {
+  async updateTask(listId, taskId, title, completed, dueDate) {
     await this.requestJson("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, {
       title,
-      status: completed ? "completed" : "notStarted"
+      status: completed ? "completed" : "notStarted",
+      dueDateTime: dueDate ? buildGraphDueDateTime(dueDate) : null
     });
   }
   async deleteTask(listId, taskId) {
@@ -73,7 +97,7 @@ var GraphClient = class {
   async requestJson(method, url, jsonBody, forceRefresh = false) {
     const token = await this.plugin.getValidAccessToken(forceRefresh);
     if (!token) throw new Error("\u672A\u5B8C\u6210\u8BA4\u8BC1");
-    const response = await (0, import_obsidian.requestUrl)({
+    const response = await requestUrlNoThrow({
       url,
       method,
       headers: {
@@ -86,7 +110,7 @@ var GraphClient = class {
       return this.requestJson(method, url, jsonBody, true);
     }
     if (response.status >= 400) {
-      const message = typeof response.text === "string" && response.text.trim().length > 0 ? response.text : `Graph \u8BF7\u6C42\u5931\u8D25\uFF0C\u72B6\u6001\u7801 ${response.status}`;
+      const message = formatGraphFailure(url, response.status, response.json, response.text);
       throw new GraphError(response.status, message);
     }
     return response.json;
@@ -146,36 +170,52 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "graph");
     __publicField(this, "todoListsCache", []);
     __publicField(this, "autoSyncTimerId", null);
+    __publicField(this, "loginInProgress", false);
+    __publicField(this, "pendingDeviceCode", null);
   }
   async onload() {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
     this.addCommand({
       id: "sync-current-file-two-way",
-      name: "Sync current file with Microsoft To Do (two-way)",
+      name: "Obsidian-MicrosoftToDo-Link: Sync current file with Microsoft To Do (two-way)",
       callback: () => {
         this.syncCurrentFileTwoWay();
       }
     });
     this.addCommand({
       id: "sync-all-mapped-files-two-way",
-      name: "Sync mapped files with Microsoft To Do (two-way)",
+      name: "Obsidian-MicrosoftToDo-Link: Sync mapped files with Microsoft To Do (two-way)",
       callback: () => {
         this.syncMappedFilesTwoWay();
       }
     });
     this.addCommand({
       id: "select-list-for-current-file",
-      name: "Select Microsoft To Do list for current file",
+      name: "Obsidian-MicrosoftToDo-Link: Select Microsoft To Do list for current file",
       callback: () => {
         this.selectListForCurrentFile();
       }
     });
     this.addCommand({
       id: "clear-current-file-sync-state",
-      name: "Clear sync state for current file",
+      name: "Obsidian-MicrosoftToDo-Link: Clear sync state for current file",
       callback: () => {
         this.clearSyncStateForCurrentFile();
+      }
+    });
+    this.addCommand({
+      id: "pull-todo-into-current-file",
+      name: "Obsidian-MicrosoftToDo-Link: Pull Microsoft To Do tasks into current file",
+      callback: () => {
+        this.pullTodoIntoCurrentFile();
+      }
+    });
+    this.addCommand({
+      id: "sync-current-file-full",
+      name: "Obsidian-MicrosoftToDo-Link: Sync current file now (push + pull active)",
+      callback: () => {
+        this.syncCurrentFileNow();
       }
     });
     this.addSettingTab(new MicrosoftToDoSettingTab(this.app, this));
@@ -223,13 +263,60 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     const tenant = this.settings.tenantId || "common";
     const device = await createDeviceCode(this.settings.clientId, tenant);
     const message = device.message || `\u5728\u6D4F\u89C8\u5668\u4E2D\u8BBF\u95EE ${device.verification_uri} \u5E76\u8F93\u5165\u4EE3\u7801 ${device.user_code}`;
-    new import_obsidian.Notice(message, device.expires_in * 1e3);
+    new import_obsidian.Notice(message, Number.isFinite(device.expires_in) ? device.expires_in * 1e3 : 1e4);
     const token = await pollForToken(device, this.settings.clientId, tenant);
     this.settings.accessToken = token.access_token;
     this.settings.accessTokenExpiresAt = now + Math.max(0, token.expires_in - 60) * 1e3;
     if (token.refresh_token) this.settings.refreshToken = token.refresh_token;
     await this.saveDataModel();
     return token.access_token;
+  }
+  isLoggedIn() {
+    const now = Date.now();
+    const tokenValid = Boolean(this.settings.accessToken) && this.settings.accessTokenExpiresAt > now + 6e4;
+    const canRefresh = Boolean(this.settings.refreshToken);
+    return tokenValid || canRefresh;
+  }
+  async logout() {
+    this.settings.accessToken = "";
+    this.settings.refreshToken = "";
+    this.settings.accessTokenExpiresAt = 0;
+    this.pendingDeviceCode = null;
+    await this.saveDataModel();
+  }
+  async startInteractiveLogin(onUpdate) {
+    if (this.loginInProgress) return;
+    if (!this.settings.clientId) {
+      new import_obsidian.Notice("\u8BF7\u5148\u586B\u5199 Azure \u5E94\u7528 Client ID");
+      return;
+    }
+    this.loginInProgress = true;
+    try {
+      await this.logout();
+      const tenant = this.settings.tenantId || "common";
+      const device = await createDeviceCode(this.settings.clientId, tenant);
+      this.pendingDeviceCode = {
+        userCode: device.user_code,
+        verificationUri: device.verification_uri,
+        expiresAt: Date.now() + Math.max(1, device.expires_in) * 1e3
+      };
+      onUpdate == null ? void 0 : onUpdate();
+      try {
+        window.open(device.verification_uri, "_blank");
+      } catch (_) {
+      }
+      new import_obsidian.Notice(device.message || `\u5728\u6D4F\u89C8\u5668\u4E2D\u8BBF\u95EE ${device.verification_uri} \u5E76\u8F93\u5165\u4EE3\u7801 ${device.user_code}`, Math.max(1e4, Math.min(6e4, device.expires_in * 1e3)));
+      const token = await pollForToken(device, this.settings.clientId, tenant);
+      this.settings.accessToken = token.access_token;
+      this.settings.accessTokenExpiresAt = Date.now() + Math.max(0, token.expires_in - 60) * 1e3;
+      if (token.refresh_token) this.settings.refreshToken = token.refresh_token;
+      this.pendingDeviceCode = null;
+      await this.saveDataModel();
+      onUpdate == null ? void 0 : onUpdate();
+      new import_obsidian.Notice("\u5DF2\u767B\u5F55");
+    } finally {
+      this.loginInProgress = false;
+    }
   }
   async fetchTodoLists(force = false) {
     if (this.todoListsCache.length > 0 && !force) return this.todoListsCache;
@@ -311,6 +398,99 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
     }
   }
+  async syncCurrentFileNow() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new import_obsidian.Notice("\u672A\u627E\u5230\u5F53\u524D\u6D3B\u52A8\u7684 Markdown \u6587\u4EF6");
+      return;
+    }
+    const listId = this.getListIdForFile(file.path);
+    if (!listId) {
+      new import_obsidian.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u9009\u62E9\u9ED8\u8BA4\u5217\u8868\uFF0C\u6216\u4E3A\u5F53\u524D\u6587\u4EF6\u9009\u62E9\u5217\u8868");
+      return;
+    }
+    try {
+      await this.syncFileTwoWay(file);
+      const added = await this.pullTodoTasksIntoFile(file, listId, false);
+      await this.syncFileTwoWay(file);
+      if (added > 0) {
+        new import_obsidian.Notice(`\u540C\u6B65\u5B8C\u6210\uFF08\u62C9\u53D6\u65B0\u589E ${added} \u6761\u672A\u5B8C\u6210\u4EFB\u52A1\uFF09`);
+      } else {
+        new import_obsidian.Notice("\u540C\u6B65\u5B8C\u6210");
+      }
+    } catch (error) {
+      console.error(error);
+      new import_obsidian.Notice(normalizeErrorMessage(error) || "\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+    }
+  }
+  async pullTodoIntoCurrentFile() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new import_obsidian.Notice("\u672A\u627E\u5230\u5F53\u524D\u6D3B\u52A8\u7684 Markdown \u6587\u4EF6");
+      return;
+    }
+    const listId = this.getListIdForFile(file.path);
+    if (!listId) {
+      new import_obsidian.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u9009\u62E9\u9ED8\u8BA4\u5217\u8868\uFF0C\u6216\u4E3A\u5F53\u524D\u6587\u4EF6\u9009\u62E9\u5217\u8868");
+      return;
+    }
+    try {
+      const added = await this.pullTodoTasksIntoFile(file, listId, true);
+      if (added === 0) {
+        new import_obsidian.Notice("\u6CA1\u6709\u53EF\u62C9\u53D6\u7684\u65B0\u4EFB\u52A1");
+      } else {
+        new import_obsidian.Notice(`\u5DF2\u62C9\u53D6 ${added} \u6761\u4EFB\u52A1\u5230\u5F53\u524D\u6587\u4EF6`);
+      }
+    } catch (error) {
+      console.error(error);
+      new import_obsidian.Notice(normalizeErrorMessage(error) || "\u62C9\u53D6\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+    }
+  }
+  async pullTodoTasksIntoFile(file, listId, syncAfter) {
+    await this.getValidAccessToken();
+    const remoteTasks = await this.graph.listTasks(listId, 200, true);
+    const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map((m) => m.graphTaskId));
+    const newTasks = remoteTasks.filter((t) => t && t.id && !existingGraphIds.has(t.id));
+    if (newTasks.length === 0) return 0;
+    let content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const hadTrailingBlank = lines.length > 0 && lines[lines.length - 1].trim().length === 0;
+    if (!hadTrailingBlank) lines.push("");
+    lines.push("");
+    const fileMtime = file.stat.mtime;
+    let added = 0;
+    for (const task of newTasks) {
+      const parts = extractDueFromMarkdownTitle((task.title || "").trim());
+      const dueDate = extractDueDateFromGraphTask(task) || parts.dueDate;
+      const title = parts.title.trim();
+      if (!title) continue;
+      const completed = graphStatusToCompleted(task.status);
+      const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${blockId}`;
+      lines.push(line);
+      const mappingKey = buildMappingKey(file.path, blockId);
+      const localHash = hashTask(title, completed, dueDate);
+      const graphHash = hashGraphTask(task);
+      this.dataModel.taskMappings[mappingKey] = {
+        listId,
+        graphTaskId: task.id,
+        lastSyncedAt: Date.now(),
+        lastSyncedLocalHash: localHash,
+        lastSyncedGraphHash: graphHash,
+        lastSyncedFileMtime: fileMtime,
+        lastKnownGraphLastModified: task.lastModifiedDateTime
+      };
+      added++;
+    }
+    if (added > 0) {
+      await this.app.vault.modify(file, lines.join("\n"));
+      await this.saveDataModel();
+      if (syncAfter) {
+        await this.syncFileTwoWay(file);
+      }
+    }
+    return added;
+  }
   async syncMappedFilesTwoWay() {
     const filePaths = Object.keys(this.dataModel.fileConfigs);
     if (filePaths.length === 0) return;
@@ -325,7 +505,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     }
   }
   async syncFileTwoWay(file) {
-    var _a, _b;
+    var _a, _b, _c, _d;
     const listId = this.getListIdForFile(file.path);
     if (!listId) {
       new import_obsidian.Notice("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u9009\u62E9\u9ED8\u8BA4\u5217\u8868\uFF0C\u6216\u4E3A\u5F53\u524D\u6587\u4EF6\u9009\u62E9\u5217\u8868");
@@ -346,9 +526,9 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     for (const task of tasks) {
       const mappingKey = buildMappingKey(file.path, task.blockId);
       const existing = this.dataModel.taskMappings[mappingKey];
-      const localHash = hashTask(task.title, task.completed);
+      const localHash = hashTask(task.title, task.completed, task.dueDate);
       if (!existing) {
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash2 = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -362,7 +542,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         continue;
       }
       if (existing.listId !== listId) {
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash2 = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -378,7 +558,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       const remote = await this.graph.getTask(existing.listId, existing.graphTaskId);
       if (!remote) {
         delete this.dataModel.taskMappings[mappingKey];
-        const created = await this.graph.createTask(listId, task.title, task.completed);
+        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
         const graphHash2 = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
           listId,
@@ -399,7 +579,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         continue;
       }
       if (localChanged && !graphChanged) {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_a = task.dueDate) != null ? _a : null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -408,17 +588,19 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastSyncedLocalHash: localHash,
           lastSyncedGraphHash: latestGraphHash,
           lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: (_a = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _a : remote.lastModifiedDateTime
+          lastKnownGraphLastModified: (_b = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _b : remote.lastModifiedDateTime
         };
         continue;
       }
       if (!localChanged && graphChanged) {
-        const updatedLine = formatTaskLine(task, remote.title, graphStatusToCompleted(remote.status));
+        const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
+        const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
         }
-        const newLocalHash = hashTask(remote.title, graphStatusToCompleted(remote.status));
+        const newLocalHash = hashTask(remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         this.dataModel.taskMappings[mappingKey] = {
           ...existing,
           lastSyncedAt: Date.now(),
@@ -432,12 +614,14 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       const graphTime = remote.lastModifiedDateTime ? Date.parse(remote.lastModifiedDateTime) : 0;
       const localTime = fileMtime;
       if (graphTime > localTime) {
-        const updatedLine = formatTaskLine(task, remote.title, graphStatusToCompleted(remote.status));
+        const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
+        const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
         }
-        const newLocalHash = hashTask(remote.title, graphStatusToCompleted(remote.status));
+        const newLocalHash = hashTask(remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
         this.dataModel.taskMappings[mappingKey] = {
           ...existing,
           lastSyncedAt: Date.now(),
@@ -447,7 +631,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastKnownGraphLastModified: remote.lastModifiedDateTime
         };
       } else {
-        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed);
+        await this.graph.updateTask(existing.listId, existing.graphTaskId, task.title, task.completed, (_c = task.dueDate) != null ? _c : null);
         const latest = await this.graph.getTask(existing.listId, existing.graphTaskId);
         const latestGraphHash = latest ? hashGraphTask(latest) : graphHash;
         this.dataModel.taskMappings[mappingKey] = {
@@ -456,7 +640,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           lastSyncedLocalHash: localHash,
           lastSyncedGraphHash: latestGraphHash,
           lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: (_b = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _b : remote.lastModifiedDateTime
+          lastKnownGraphLastModified: (_d = latest == null ? void 0 : latest.lastModifiedDateTime) != null ? _d : remote.lastModifiedDateTime
         };
       }
     }
@@ -541,7 +725,9 @@ function parseMarkdownTasks(lines) {
     if (!rest) continue;
     const blockMatch = blockIdPattern.exec(rest);
     const existingBlockId = blockMatch ? blockMatch[1] : "";
-    const title = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    const rawTitle = blockMatch ? rest.slice(0, blockMatch.index).trim() : rest;
+    if (!rawTitle) continue;
+    const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
     const blockId = existingBlockId && existingBlockId.startsWith(BLOCK_ID_PREFIX) ? existingBlockId : "";
     tasks.push({
@@ -550,6 +736,7 @@ function parseMarkdownTasks(lines) {
       bullet,
       completed,
       title,
+      dueDate,
       blockId
     });
   }
@@ -564,15 +751,15 @@ function ensureBlockIds(lines, tasks) {
       continue;
     }
     const newBlockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${task.title} ^${newBlockId}`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} ^${newBlockId}`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
   }
   return { tasks: updated, changed };
 }
-function formatTaskLine(task, title, completed) {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${title} ^${task.blockId}`;
+function formatTaskLine(task, title, completed, dueDate) {
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} ^${task.blockId}`;
 }
 function randomId(length) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -588,14 +775,53 @@ function randomId(length) {
 function buildMappingKey(filePath, blockId) {
   return `${filePath}::${blockId}`;
 }
-function hashTask(title, completed) {
-  return `${completed ? "1" : "0"}|${title}`;
+function hashTask(title, completed, dueDate) {
+  return `${completed ? "1" : "0"}|${title}|${dueDate || ""}`;
 }
 function hashGraphTask(task) {
-  return hashTask(task.title, graphStatusToCompleted(task.status));
+  const normalized = extractDueFromMarkdownTitle(task.title || "");
+  const dueDate = extractDueDateFromGraphTask(task) || normalized.dueDate;
+  return hashTask(normalized.title, graphStatusToCompleted(task.status), dueDate);
 }
 function graphStatusToCompleted(status) {
   return status === "completed";
+}
+function buildMarkdownTaskTitle(title, dueDate) {
+  const trimmed = (title || "").trim();
+  if (!trimmed) return trimmed;
+  if (!dueDate) return trimmed;
+  return `${trimmed} \u{1F4C5} ${dueDate}`;
+}
+function extractDueFromMarkdownTitle(rawTitle) {
+  const input = (rawTitle || "").trim();
+  if (!input) return { title: "" };
+  const duePattern = /(?:^|\s)📅\s*(\d{4}-\d{2}-\d{2})(?=\s|$)/g;
+  let dueDate;
+  let cleaned = input;
+  let match;
+  while ((match = duePattern.exec(input)) !== null) {
+    dueDate = match[1];
+  }
+  cleaned = cleaned.replace(duePattern, " ").replace(/\s{2,}/g, " ").trim();
+  return { title: cleaned, dueDate };
+}
+function extractDueDateFromGraphTask(task) {
+  var _a;
+  const dt = (_a = task.dueDateTime) == null ? void 0 : _a.dateTime;
+  if (typeof dt === "string" && dt.length >= 10) return dt.slice(0, 10);
+  return void 0;
+}
+function buildGraphDueDateTime(dueDate) {
+  const timeZone = getLocalTimeZone();
+  return { dateTime: `${dueDate}T00:00:00`, timeZone };
+}
+function getLocalTimeZone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof tz === "string" && tz.trim().length > 0 ? tz : "UTC";
+  } catch (_) {
+    return "UTC";
+  }
 }
 async function createDeviceCode(clientId, tenantId) {
   const url = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/devicecode`;
@@ -603,7 +829,7 @@ async function createDeviceCode(clientId, tenantId) {
     client_id: clientId,
     scope: "Tasks.ReadWrite offline_access"
   }).toString();
-  const response = await (0, import_obsidian.requestUrl)({
+  const response = await requestUrlNoThrow({
     url,
     method: "POST",
     headers: {
@@ -611,7 +837,18 @@ async function createDeviceCode(clientId, tenantId) {
     },
     body
   });
-  return response.json;
+  const json = response.json;
+  if (response.status >= 400) {
+    throw new Error(formatAadFailure("\u83B7\u53D6\u8BBE\u5907\u4EE3\u7801\u5931\u8D25", json, response.status, response.text));
+  }
+  if (isAadErrorResponse(json)) {
+    throw new Error(formatAadFailure("\u83B7\u53D6\u8BBE\u5907\u4EE3\u7801\u5931\u8D25", json, response.status, response.text));
+  }
+  const device = json;
+  if (!device.device_code || !device.user_code || !device.verification_uri) {
+    throw new Error(formatAadFailure("\u83B7\u53D6\u8BBE\u5907\u4EE3\u7801\u5931\u8D25", json, response.status, response.text));
+  }
+  return device;
 }
 async function pollForToken(device, clientId, tenantId) {
   const url = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
@@ -623,7 +860,7 @@ async function pollForToken(device, clientId, tenantId) {
   const interval = device.interval || 5;
   const maxAttempts = Math.ceil(device.expires_in / interval);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const response = await (0, import_obsidian.requestUrl)({
+    const response = await requestUrlNoThrow({
       url,
       method: "POST",
       headers: {
@@ -635,7 +872,9 @@ async function pollForToken(device, clientId, tenantId) {
       return response.json;
     }
     const data = response.json;
-    if (!data.error) throw new Error("\u672A\u7ECF\u9884\u671F\u7684\u4EE4\u724C\u54CD\u5E94");
+    if (!isAadErrorResponse(data)) {
+      throw new Error(formatAadFailure("\u83B7\u53D6\u8BBF\u95EE\u4EE4\u724C\u5931\u8D25", data, response.status, response.text));
+    }
     if (data.error === "authorization_pending") {
       await delay(interval * 1e3);
       continue;
@@ -644,7 +883,7 @@ async function pollForToken(device, clientId, tenantId) {
       await delay((interval + 5) * 1e3);
       continue;
     }
-    throw new Error(data.error);
+    throw new Error(formatAadFailure("\u83B7\u53D6\u8BBF\u95EE\u4EE4\u724C\u5931\u8D25", data, response.status, response.text));
   }
   throw new Error("\u8BBE\u5907\u4EE3\u7801\u5728\u6388\u6743\u5B8C\u6210\u524D\u5DF2\u8FC7\u671F");
 }
@@ -656,7 +895,7 @@ async function refreshAccessToken(clientId, tenantId, refreshToken) {
     refresh_token: refreshToken,
     scope: "Tasks.ReadWrite offline_access"
   }).toString();
-  const response = await (0, import_obsidian.requestUrl)({
+  const response = await requestUrlNoThrow({
     url,
     method: "POST",
     headers: {
@@ -665,13 +904,92 @@ async function refreshAccessToken(clientId, tenantId, refreshToken) {
     body
   });
   if (response.status >= 400) {
-    const message = typeof response.text === "string" ? response.text : `\u5237\u65B0\u4EE4\u724C\u5931\u8D25\uFF0C\u72B6\u6001\u7801 ${response.status}`;
-    throw new Error(message);
+    const json = response.json;
+    throw new Error(formatAadFailure("\u5237\u65B0\u4EE4\u724C\u5931\u8D25", json, response.status, response.text));
   }
   return response.json;
 }
 async function delay(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+function isAadErrorResponse(value) {
+  if (!value || typeof value !== "object") return false;
+  const obj = value;
+  return typeof obj.error === "string";
+}
+function isGraphErrorResponse(value) {
+  if (!value || typeof value !== "object") return false;
+  const obj = value;
+  if (!obj.error || typeof obj.error !== "object") return false;
+  return true;
+}
+function formatGraphFailure(url, status, json, rawText) {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (isGraphErrorResponse(json)) {
+    const code = typeof json.error.code === "string" ? json.error.code.trim() : "";
+    const msg = typeof json.error.message === "string" ? json.error.message.trim() : "";
+    const parts = [
+      "Graph \u8BF7\u6C42\u5931\u8D25",
+      `HTTP ${status}`,
+      code ? `\u9519\u8BEF\uFF1A${code}` : "",
+      msg ? `\u8BF4\u660E\uFF1A${msg}` : "",
+      `\u63A5\u53E3\uFF1A${url}`
+    ].filter(Boolean);
+    return parts.join("\n");
+  }
+  if (text) return `Graph \u8BF7\u6C42\u5931\u8D25
+HTTP ${status}
+${text}
+\u63A5\u53E3\uFF1A${url}`;
+  return `Graph \u8BF7\u6C42\u5931\u8D25\uFF08HTTP ${status}\uFF09
+\u63A5\u53E3\uFF1A${url}`;
+}
+function formatAadFailure(prefix, json, status, rawText) {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (isAadErrorResponse(json)) {
+    const desc = (json.error_description || "").trim();
+    const hint = buildAadHint(json.error, desc);
+    const parts = [
+      prefix,
+      status ? `HTTP ${status}` : "",
+      json.error ? `\u9519\u8BEF\uFF1A${json.error}` : "",
+      desc ? `\u8BF4\u660E\uFF1A${desc}` : "",
+      hint ? `\u5EFA\u8BAE\uFF1A${hint}` : ""
+    ].filter(Boolean);
+    return parts.join("\n");
+  }
+  if (text) return `${prefix}
+HTTP ${status != null ? status : ""}
+${text}`.trim();
+  return `${prefix}${status ? `\uFF08HTTP ${status}\uFF09` : ""}`;
+}
+function buildAadHint(code, description) {
+  const merged = `${code} ${description}`.toLowerCase();
+  if (merged.includes("unauthorized_client") || merged.includes("public client") || merged.includes("7000218")) {
+    return "\u8BF7\u5728 Azure \u5E94\u7528\u6CE8\u518C -> Authentication -> Advanced settings \u4E2D\u542F\u7528 Allow public client flows";
+  }
+  if (merged.includes("invalid_scope")) {
+    return "\u8BF7\u786E\u8BA4\u5DF2\u6DFB\u52A0 Microsoft Graph \u59D4\u6258\u6743\u9650 Tasks.ReadWrite \u4E0E offline_access\uFF0C\u5E76\u91CD\u65B0\u540C\u610F\u6388\u6743";
+  }
+  if (merged.includes("interaction_required")) {
+    return "\u8BF7\u91CD\u65B0\u6267\u884C\u767B\u5F55/\u91CD\u65B0\u767B\u5F55\u5E76\u5728\u6D4F\u89C8\u5668\u5B8C\u6210\u6388\u6743";
+  }
+  return "";
+}
+function normalizeErrorMessage(error) {
+  if (error instanceof GraphError) return error.message;
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "";
+}
+async function requestUrlNoThrow(params) {
+  var _a;
+  const response = await (0, import_obsidian.requestUrl)({ ...params, throw: false });
+  return {
+    status: response.status,
+    text: (_a = response.text) != null ? _a : "",
+    json: response.json
+  };
 }
 var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
@@ -682,7 +1000,7 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Microsoft To Do Link" });
+    containerEl.createEl("h2", { text: "Obsidian-MicrosoftToDo-Link" });
     new import_obsidian.Setting(containerEl).setName("Azure \u5E94\u7528 Client ID").setDesc("\u5728 Azure \u95E8\u6237\u4E2D\u6CE8\u518C\u7684\u516C\u5171\u5BA2\u6237\u7AEF ID").addText(
       (text) => text.setPlaceholder("00000000-0000-0000-0000-000000000000").setValue(this.plugin.settings.clientId).onChange(async (value) => {
         this.plugin.settings.clientId = value.trim();
@@ -695,20 +1013,108 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveDataModel();
       })
     );
+    const loginSetting = new import_obsidian.Setting(containerEl).setName("\u8D26\u53F7\u72B6\u6001");
+    const statusEl = loginSetting.descEl.createDiv();
+    statusEl.style.marginTop = "6px";
+    const now = Date.now();
+    const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 6e4;
+    const canRefresh = Boolean(this.plugin.settings.refreshToken);
+    if (tokenValid) {
+      statusEl.setText("\u5DF2\u767B\u5F55");
+    } else if (canRefresh) {
+      statusEl.setText("\u5DF2\u4FDD\u5B58\u6388\u6743\uFF08\u5C06\u81EA\u52A8\u5237\u65B0\u4EE4\u724C\uFF09");
+    } else {
+      statusEl.setText("\u672A\u767B\u5F55");
+    }
+    const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
+    if (pending) {
+      new import_obsidian.Setting(containerEl).setName("\u8BBE\u5907\u767B\u5F55\u4EE3\u7801").setDesc("\u590D\u5236\u4EE3\u7801\u5230\u7F51\u9875\u767B\u5F55\u9875\u9762").addText((text) => {
+        text.setValue(pending.userCode);
+        text.inputEl.readOnly = true;
+      }).addButton(
+        (btn) => btn.setButtonText("\u590D\u5236\u4EE3\u7801").onClick(async () => {
+          try {
+            await navigator.clipboard.writeText(pending.userCode);
+            new import_obsidian.Notice("\u5DF2\u590D\u5236");
+          } catch (error) {
+            console.error(error);
+            new import_obsidian.Notice("\u590D\u5236\u5931\u8D25");
+          }
+        })
+      ).addButton(
+        (btn) => btn.setButtonText("\u6253\u5F00\u767B\u5F55\u7F51\u9875").onClick(() => {
+          try {
+            window.open(pending.verificationUri, "_blank");
+          } catch (error) {
+            console.error(error);
+            new import_obsidian.Notice("\u65E0\u6CD5\u6253\u5F00\u6D4F\u89C8\u5668");
+          }
+        })
+      );
+    }
+    new import_obsidian.Setting(containerEl).setName("\u767B\u5F55/\u9000\u51FA").setDesc("\u767B\u5F55\u5C06\u81EA\u52A8\u6253\u5F00\u7F51\u9875\u767B\u5F55\u9875\u9762\uFF1B\u9000\u51FA\u4F1A\u6E05\u9664\u672C\u5730\u4EE4\u724C").addButton(
+      (btn) => btn.setButtonText(this.plugin.isLoggedIn() ? "\u9000\u51FA\u767B\u5F55" : "\u767B\u5F55").onClick(async () => {
+        try {
+          if (this.plugin.isLoggedIn()) {
+            await this.plugin.logout();
+            new import_obsidian.Notice("\u5DF2\u9000\u51FA\u767B\u5F55");
+            this.display();
+            return;
+          }
+          await this.plugin.startInteractiveLogin(() => this.display());
+        } catch (error) {
+          const message = normalizeErrorMessage(error);
+          console.error(error);
+          new import_obsidian.Notice(message || "\u767B\u5F55\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+          this.display();
+        }
+      })
+    );
     new import_obsidian.Setting(containerEl).setName("\u9ED8\u8BA4 Microsoft To Do \u5217\u8868").setDesc("\u672A\u5355\u72EC\u914D\u7F6E\u7684\u6587\u4EF6\u5C06\u4F7F\u7528\u8BE5\u5217\u8868").addButton(
       (btn) => btn.setButtonText("\u9009\u62E9\u5217\u8868").onClick(async () => {
         try {
           await this.plugin.selectDefaultListWithUi();
           this.display();
         } catch (error) {
+          const message = normalizeErrorMessage(error);
           console.error(error);
-          new import_obsidian.Notice("\u52A0\u8F7D\u5217\u8868\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+          new import_obsidian.Notice(message || "\u52A0\u8F7D\u5217\u8868\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
         }
       })
     ).addText(
       (text) => text.setPlaceholder("\u5217\u8868 ID\uFF08\u53EF\u9009\uFF09").setValue(this.plugin.settings.defaultListId).onChange(async (value) => {
         this.plugin.settings.defaultListId = value.trim();
         await this.plugin.saveDataModel();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("\u7ACB\u5373\u540C\u6B65").setDesc("\u4E00\u952E\u6267\u884C\u53CC\u5411\u540C\u6B65\uFF1A\u5148\u540C\u6B65\u5F53\u524D\u6587\u4EF6\uFF0C\u518D\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6").addButton(
+      (btn) => btn.setButtonText("\u540C\u6B65\u5F53\u524D\u6587\u4EF6").onClick(async () => {
+        try {
+          await this.plugin.syncCurrentFileTwoWay();
+        } catch (error) {
+          const message = normalizeErrorMessage(error);
+          console.error(error);
+          new import_obsidian.Notice(message || "\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+        }
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("\u5B8C\u6574\u540C\u6B65\uFF08\u63A8\u9001+\u62C9\u53D6\u672A\u5B8C\u6210\uFF09").onClick(async () => {
+        await this.plugin.syncCurrentFileNow();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6").onClick(async () => {
+        try {
+          await this.plugin.syncMappedFilesTwoWay();
+          new import_obsidian.Notice("\u540C\u6B65\u5B8C\u6210");
+        } catch (error) {
+          const message = normalizeErrorMessage(error);
+          console.error(error);
+          new import_obsidian.Notice(message || "\u540C\u6B65\u5931\u8D25\uFF0C\u8BE6\u7EC6\u4FE1\u606F\u8BF7\u67E5\u770B\u63A7\u5236\u53F0");
+        }
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("\u4ECE To Do \u62C9\u53D6\u5230\u5F53\u524D\u6587\u4EF6").onClick(async () => {
+        await this.plugin.pullTodoIntoCurrentFile();
       })
     );
     new import_obsidian.Setting(containerEl).setName("\u81EA\u52A8\u540C\u6B65").setDesc("\u6309\u56FA\u5B9A\u95F4\u9694\u540C\u6B65\u5DF2\u7ED1\u5B9A\u5217\u8868\u7684\u6587\u4EF6").addToggle(
