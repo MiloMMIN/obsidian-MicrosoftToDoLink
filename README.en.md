@@ -112,6 +112,12 @@ Sync order:
 - `- [ ]` / `- [x]`: open/completed
 - `📅 YYYY-MM-DD`: optional due date mapped to To Do
 
+## Compatibility & dependencies
+
+- **No hard dependency on the Obsidian Tasks plugin**: this plugin only requires standard Markdown task syntax (`- [ ]` / `- [x]`). Sync works without any additional task plugin.
+- **About `📅 YYYY-MM-DD`**: this is a convention. Obsidian core treats it as plain text, but many task plugins (especially Obsidian Tasks) interpret it as a due date and enable advanced filtering/sorting/query views.
+- **Nested subtasks**: Obsidian core can render nested checkboxes; advanced task dashboards typically require a task plugin.
+
 ### Subtasks (Steps / checklist items)
 
 Represented as nested tasks:
@@ -196,4 +202,3 @@ npm install
 npm run typecheck
 npm run build
 ```
-

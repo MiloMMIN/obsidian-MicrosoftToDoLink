@@ -120,6 +120,12 @@ App registrations → 你的应用 → API permissions：
 - `- [ ]` / `- [x]`：未完成/已完成
 - `📅 YYYY-MM-DD`：可选，将同步为 To Do 的截止日期
 
+## 兼容性与依赖
+
+- **不强制依赖 Obsidian Tasks 插件**：本插件只要求任务行是标准 Markdown 任务（`- [ ]` / `- [x]`）。即使你不安装 Tasks 插件，同步也能工作。
+- **关于 `📅 YYYY-MM-DD`**：这是一个“约定格式”。Obsidian 核心不会把它当作字段，默认只把它当作普通文本；但很多任务类插件（尤其是 Obsidian Tasks）会把它识别为 due date，从而支持筛选/排序/查询等“高级任务视图”。
+- **子任务展示**：Obsidian 核心能显示嵌套列表与复选框；如果你依赖“任务查询/聚合视图”，通常也需要配合任务类插件。
+
 ### 子任务（Steps / checklist items）
 
 会以嵌套任务的形式展现：
@@ -193,7 +199,6 @@ App registrations → 你的应用 → API permissions：
 
 - 用户误删整段内容/误清空文件
 - 批量编辑导致任务解析失败
-
 
 ## 常见问题
 
