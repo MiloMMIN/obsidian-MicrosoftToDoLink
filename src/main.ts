@@ -1,4 +1,4 @@
-import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } from "obsidian";
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, Setting, TFile, requestUrl } from "obsidian";
 
 type DeviceCodeResponse = {
   device_code: string;
@@ -216,7 +216,7 @@ class GraphClient {
 
   private async requestJson<T>(method: string, url: string, jsonBody?: unknown, forceRefresh = false): Promise<T> {
     const token = await this.plugin.getValidAccessToken(forceRefresh);
-    if (!token) throw new Error("未完成认证");
+    if (!token) throw new Error("Authentication required");
 
     const response = await requestUrlNoThrow({
       url,
@@ -233,7 +233,7 @@ class GraphClient {
     }
 
     if (response.status >= 400) {
-      const message = formatGraphFailure(url, response.status, response.json as unknown, response.text);
+      const message = formatGraphFailure(url, response.status, response.json, response.text);
       throw new GraphError(response.status, message);
     }
 
@@ -265,10 +265,11 @@ class ListSelectModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h3", { text: "选择 Microsoft To Do 列表" });
+    new Setting(contentEl).setName("Select Microsoft To Do list").setHeading();
 
     const selectEl = contentEl.createEl("select");
-    const emptyOption = selectEl.createEl("option", { text: "请选择…" });
+    selectEl.style.width = "100%";
+    const emptyOption = selectEl.createEl("option", { text: "Select..." });
     emptyOption.value = "";
     if (!this.selectedId) emptyOption.selected = true;
 
@@ -279,8 +280,13 @@ class ListSelectModal extends Modal {
     }
 
     const buttonRow = contentEl.createDiv({ cls: "mtd-button-row" });
-    const cancelBtn = buttonRow.createEl("button", { text: "取消" });
-    const okBtn = buttonRow.createEl("button", { text: "确定" });
+    buttonRow.setCssProps({ marginTop: "15px" });
+    buttonRow.style.display = "flex";
+    buttonRow.style.justifyContent = "flex-end";
+    buttonRow.style.gap = "10px";
+
+    const cancelBtn = buttonRow.createEl("button", { text: "Cancel" });
+    const okBtn = buttonRow.createEl("button", { text: "OK", cls: "mod-cta" });
 
     cancelBtn.onclick = () => {
       this.resolve(null);
@@ -311,55 +317,55 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
 
-    this.addRibbonIcon("refresh-cw", "Obsidian-MicrosoftToDo-Link: Sync current file", () => {
-      this.syncCurrentFileNow();
+    this.addRibbonIcon("refresh-cw", "Sync current file", async () => {
+      await this.syncCurrentFileNow();
     });
 
     this.addCommand({
       id: "sync-current-file-two-way",
-      name: "Obsidian-MicrosoftToDo-Link: Sync current file with Microsoft To Do (two-way)",
-      callback: () => {
-        this.syncCurrentFileTwoWay();
+      name: "Sync current file with Microsoft To Do (two-way)",
+      callback: async () => {
+        await this.syncCurrentFileTwoWay();
       }
     });
 
     this.addCommand({
       id: "sync-all-mapped-files-two-way",
-      name: "Obsidian-MicrosoftToDo-Link: Sync mapped files with Microsoft To Do (two-way)",
-      callback: () => {
-        this.syncMappedFilesTwoWay();
+      name: "Sync mapped files with Microsoft To Do (two-way)",
+      callback: async () => {
+        await this.syncMappedFilesTwoWay();
       }
     });
 
     this.addCommand({
       id: "select-list-for-current-file",
-      name: "Obsidian-MicrosoftToDo-Link: Select Microsoft To Do list for current file",
-      callback: () => {
-        this.selectListForCurrentFile();
+      name: "Select Microsoft To Do list for current file",
+      callback: async () => {
+        await this.selectListForCurrentFile();
       }
     });
 
     this.addCommand({
       id: "clear-current-file-sync-state",
-      name: "Obsidian-MicrosoftToDo-Link: Clear sync state for current file",
-      callback: () => {
-        this.clearSyncStateForCurrentFile();
+      name: "Clear sync state for current file",
+      callback: async () => {
+        await this.clearSyncStateForCurrentFile();
       }
     });
 
     this.addCommand({
       id: "pull-todo-into-current-file",
-      name: "Obsidian-MicrosoftToDo-Link: Pull Microsoft To Do tasks into current file",
-      callback: () => {
-        this.pullTodoIntoCurrentFile();
+      name: "Pull Microsoft To Do tasks into current file",
+      callback: async () => {
+        await this.pullTodoIntoCurrentFile();
       }
     });
 
     this.addCommand({
       id: "sync-current-file-full",
-      name: "Obsidian-MicrosoftToDo-Link: Sync current file now (push + pull active)",
-      callback: () => {
-        this.syncCurrentFileNow();
+      name: "Sync current file now (push + pull active)",
+      callback: async () => {
+        await this.syncCurrentFileNow();
       }
     });
 
@@ -393,7 +399,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
   async getValidAccessToken(forceRefresh = false): Promise<string | null> {
     if (!this.settings.clientId) {
-      new Notice("请在插件设置中配置 Azure 应用的 Client ID");
+      new Notice("Please configure Azure Client ID in plugin settings");
       return null;
     }
 
@@ -416,7 +422,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
     const tenant = this.settings.tenantId || "common";
     const device = await createDeviceCode(this.settings.clientId, tenant);
-    const message = device.message || `在浏览器中访问 ${device.verification_uri} 并输入代码 ${device.user_code}`;
+    const message = device.message || `Visit ${device.verification_uri} in browser and enter code ${device.user_code}`;
     new Notice(message, Number.isFinite(device.expires_in) ? device.expires_in * 1000 : 10_000);
     const token = await pollForToken(device, this.settings.clientId, tenant);
     this.settings.accessToken = token.access_token;
@@ -444,7 +450,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   async startInteractiveLogin(onUpdate?: () => void): Promise<void> {
     if (this.loginInProgress) return;
     if (!this.settings.clientId) {
-      new Notice("请先填写 Azure 应用 Client ID");
+      new Notice("Please enter Azure Client ID first");
       return;
     }
 
@@ -462,9 +468,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
       try {
         window.open(device.verification_uri, "_blank");
-      } catch (_) {}
+      } catch (error) {
+        console.error(error);
+      }
 
-      new Notice(device.message || `在浏览器中访问 ${device.verification_uri} 并输入代码 ${device.user_code}`, Math.max(10_000, Math.min(60_000, device.expires_in * 1000)));
+      new Notice(device.message || `Visit ${device.verification_uri} in browser and enter code ${device.user_code}`, Math.max(10_000, Math.min(60_000, device.expires_in * 1000)));
 
       const token = await pollForToken(device, this.settings.clientId, tenant);
       this.settings.accessToken = token.access_token;
@@ -473,7 +481,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       this.pendingDeviceCode = null;
       await this.saveDataModel();
       onUpdate?.();
-      new Notice("已登录");
+      new Notice("Logged in");
     } finally {
       this.loginInProgress = false;
     }
@@ -506,7 +514,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   async selectDefaultListWithUi() {
     const lists = await this.fetchTodoLists(true);
     if (lists.length === 0) {
-      new Notice("未获取到任何 Microsoft To Do 列表");
+      new Notice("No Microsoft To Do lists found");
       return;
     }
     const chosen = await this.openListPicker(lists, this.settings.defaultListId);
@@ -519,12 +527,12 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   async selectListForCurrentFile() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new Notice("未找到当前活动的 Markdown 文件");
+      new Notice("No active Markdown file found");
       return;
     }
     const lists = await this.fetchTodoLists(true);
     if (lists.length === 0) {
-      new Notice("未获取到任何 Microsoft To Do 列表");
+      new Notice("No Microsoft To Do lists found");
       return;
     }
     const current = this.dataModel.fileConfigs[file.path]?.listId || "";
@@ -532,13 +540,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     if (!chosen) return;
     this.dataModel.fileConfigs[file.path] = { listId: chosen };
     await this.saveDataModel();
-    new Notice("已为当前文件设置列表");
+    new Notice("List set for current file");
   }
 
   async clearSyncStateForCurrentFile() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new Notice("未找到当前活动的 Markdown 文件");
+      new Notice("No active Markdown file found");
       return;
     }
     delete this.dataModel.fileConfigs[file.path];
@@ -547,33 +555,33 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (key.startsWith(prefix)) delete this.dataModel.taskMappings[key];
     }
     await this.saveDataModel();
-    new Notice("已清除当前文件的同步状态");
+    new Notice("Sync state cleared for current file");
   }
 
   async syncCurrentFileTwoWay() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new Notice("未找到当前活动的 Markdown 文件");
+      new Notice("No active Markdown file found");
       return;
     }
     try {
       await this.syncFileTwoWay(file);
-      new Notice("同步完成");
+      new Notice("Sync completed");
     } catch (error) {
       console.error(error);
-      new Notice("同步失败，详细信息请查看控制台");
+      new Notice("Sync failed, check console for details");
     }
   }
 
   async syncCurrentFileNow() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new Notice("未找到当前活动的 Markdown 文件");
+      new Notice("No active Markdown file found");
       return;
     }
     const listId = this.getListIdForFile(file.path);
     if (!listId) {
-      new Notice("请先在设置中选择默认列表，或为当前文件选择列表");
+      new Notice("Please select a default list in settings or for the current file");
       return;
     }
     try {
@@ -582,39 +590,39 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       await this.syncFileTwoWay(file);
       if (added + childAdded > 0) {
         const parts: string[] = [];
-        if (added > 0) parts.push(`新增任务 ${added}`);
-        if (childAdded > 0) parts.push(`新增子任务 ${childAdded}`);
-        new Notice(`同步完成（拉取${parts.join("，")}）`);
+        if (added > 0) parts.push(`Added tasks: ${added}`);
+        if (childAdded > 0) parts.push(`Added subtasks: ${childAdded}`);
+        new Notice(`Sync completed (Pulled: ${parts.join(", ")})`);
       } else {
-        new Notice("同步完成");
+        new Notice("Sync completed");
       }
     } catch (error) {
       console.error(error);
-      new Notice(normalizeErrorMessage(error) || "同步失败，详细信息请查看控制台");
+      new Notice(normalizeErrorMessage(error) || "Sync failed, check console for details");
     }
   }
 
   async pullTodoIntoCurrentFile() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
-      new Notice("未找到当前活动的 Markdown 文件");
+      new Notice("No active Markdown file found");
       return;
     }
     const listId = this.getListIdForFile(file.path);
     if (!listId) {
-      new Notice("请先在设置中选择默认列表，或为当前文件选择列表");
+      new Notice("Please select a default list in settings or for the current file");
       return;
     }
     try {
       const added = await this.pullTodoTasksIntoFile(file, listId, true);
       if (added === 0) {
-        new Notice("没有可拉取的新任务");
+        new Notice("No new tasks to pull");
       } else {
-        new Notice(`已拉取 ${added} 条任务到当前文件`);
+        new Notice(`Pulled ${added} tasks to current file`);
       }
     } catch (error) {
       console.error(error);
-      new Notice(normalizeErrorMessage(error) || "拉取失败，详细信息请查看控制台");
+      new Notice(normalizeErrorMessage(error) || "Pull failed, check console for details");
     }
   }
 
@@ -847,7 +855,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   async syncFileTwoWay(file: TFile) {
     const listId = this.getListIdForFile(file.path);
     if (!listId) {
-      new Notice("请先在设置中选择默认列表，或为当前文件选择列表");
+      new Notice("Please select a default list in settings or for the current file");
       return;
     }
 
@@ -867,7 +875,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         for (const key of removedMappings) delete this.dataModel.taskMappings[key];
         for (const key of removedChecklistMappings) delete this.dataModel.checklistMappings[key];
         await this.saveDataModel();
-        new Notice("当前文件无任务，已解除绑定（为安全起见未修改云端）");
+        new Notice("No tasks in file, binding removed (Cloud tasks unchanged for safety)");
         return;
       }
 
@@ -925,7 +933,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       }
 
       await this.saveDataModel();
-      new Notice("已同步删除策略到云端");
+      new Notice("Deletion policy synced to cloud");
       return;
     }
 
@@ -1315,19 +1323,45 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
 
   const obj = raw as Record<string, unknown>;
 
+  const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object";
+
+  const fileConfigs = isRecord(obj.fileConfigs) ? (obj.fileConfigs as Record<string, FileSyncConfig>) : {};
+  const taskMappings = isRecord(obj.taskMappings) ? (obj.taskMappings as Record<string, TaskMappingEntry>) : {};
+  const checklistMappings = isRecord(obj.checklistMappings) ? (obj.checklistMappings as Record<string, ChecklistMappingEntry>) : {};
+
   if ("settings" in obj) {
-    const settings = (obj.settings as any) || {};
+    const settingsRaw = isRecord(obj.settings) ? obj.settings : {};
+    const deletionPolicyRaw = settingsRaw.deletionPolicy;
+    const deleteRemoteWhenRemovedRaw = settingsRaw.deleteRemoteWhenRemoved;
     const deletionPolicy: DeletionPolicy =
-      settings.deletionPolicy === "delete" || settings.deletionPolicy === "detach" || settings.deletionPolicy === "complete"
-        ? settings.deletionPolicy
-        : settings.deleteRemoteWhenRemoved === true
+      deletionPolicyRaw === "delete" || deletionPolicyRaw === "detach" || deletionPolicyRaw === "complete"
+        ? deletionPolicyRaw
+        : deleteRemoteWhenRemovedRaw === true
           ? "delete"
           : "complete";
+
+    const migratedSettings: MicrosoftToDoSettings = {
+      ...DEFAULT_SETTINGS,
+      clientId: typeof settingsRaw.clientId === "string" ? settingsRaw.clientId : DEFAULT_SETTINGS.clientId,
+      tenantId: typeof settingsRaw.tenantId === "string" ? settingsRaw.tenantId : DEFAULT_SETTINGS.tenantId,
+      defaultListId: typeof settingsRaw.defaultListId === "string" ? settingsRaw.defaultListId : DEFAULT_SETTINGS.defaultListId,
+      accessToken: typeof settingsRaw.accessToken === "string" ? settingsRaw.accessToken : DEFAULT_SETTINGS.accessToken,
+      refreshToken: typeof settingsRaw.refreshToken === "string" ? settingsRaw.refreshToken : DEFAULT_SETTINGS.refreshToken,
+      accessTokenExpiresAt:
+        typeof settingsRaw.accessTokenExpiresAt === "number" ? settingsRaw.accessTokenExpiresAt : DEFAULT_SETTINGS.accessTokenExpiresAt,
+      autoSyncEnabled: typeof settingsRaw.autoSyncEnabled === "boolean" ? settingsRaw.autoSyncEnabled : DEFAULT_SETTINGS.autoSyncEnabled,
+      autoSyncIntervalMinutes:
+        typeof settingsRaw.autoSyncIntervalMinutes === "number"
+          ? settingsRaw.autoSyncIntervalMinutes
+          : DEFAULT_SETTINGS.autoSyncIntervalMinutes,
+      deletionPolicy
+    };
+
     return {
-      settings: { ...DEFAULT_SETTINGS, ...settings, deletionPolicy },
-      fileConfigs: (obj.fileConfigs as Record<string, FileSyncConfig>) || {},
-      taskMappings: (obj.taskMappings as Record<string, TaskMappingEntry>) || {},
-      checklistMappings: (obj.checklistMappings as Record<string, ChecklistMappingEntry>) || {}
+      settings: migratedSettings,
+      fileConfigs,
+      taskMappings,
+      checklistMappings
     };
   }
 
@@ -1349,10 +1383,10 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
   }
 
   return {
-    settings: { ...DEFAULT_SETTINGS, ...(obj.settings as any) },
-    fileConfigs: (obj.fileConfigs as Record<string, FileSyncConfig>) || {},
-    taskMappings: (obj.taskMappings as Record<string, TaskMappingEntry>) || {},
-    checklistMappings: (obj.checklistMappings as Record<string, ChecklistMappingEntry>) || {}
+    settings: { ...DEFAULT_SETTINGS },
+    fileConfigs,
+    taskMappings,
+    checklistMappings
   };
 }
 
@@ -1515,7 +1549,7 @@ function getLocalTimeZone(): string {
   try {
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
     return typeof tz === "string" && tz.trim().length > 0 ? tz : "UTC";
-  } catch (_) {
+  } catch {
     return "UTC";
   }
 }
@@ -1536,14 +1570,14 @@ async function createDeviceCode(clientId: string, tenantId: string): Promise<Dev
   });
   const json = response.json as unknown;
   if (response.status >= 400) {
-    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+    throw new Error(formatAadFailure("Failed to get device code", json, response.status, response.text));
   }
   if (isAadErrorResponse(json)) {
-    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+    throw new Error(formatAadFailure("Failed to get device code", json, response.status, response.text));
   }
   const device = json as DeviceCodeResponse;
   if (!device.device_code || !device.user_code || !device.verification_uri) {
-    throw new Error(formatAadFailure("获取设备代码失败", json, response.status, response.text));
+    throw new Error(formatAadFailure("Failed to get device code", json, response.status, response.text));
   }
   return device;
 }
@@ -1571,7 +1605,7 @@ async function pollForToken(device: DeviceCodeResponse, clientId: string, tenant
     }
     const data = response.json as unknown;
     if (!isAadErrorResponse(data)) {
-      throw new Error(formatAadFailure("获取访问令牌失败", data, response.status, response.text));
+      throw new Error(formatAadFailure("Failed to get access token", data, response.status, response.text));
     }
     if (data.error === "authorization_pending") {
       await delay(interval * 1000);
@@ -1581,9 +1615,9 @@ async function pollForToken(device: DeviceCodeResponse, clientId: string, tenant
       await delay((interval + 5) * 1000);
       continue;
     }
-    throw new Error(formatAadFailure("获取访问令牌失败", data, response.status, response.text));
+    throw new Error(formatAadFailure("Failed to get access token", data, response.status, response.text));
   }
-  throw new Error("设备代码在授权完成前已过期");
+  throw new Error("Device code expired before authorization");
 }
 
 async function refreshAccessToken(clientId: string, tenantId: string, refreshToken: string): Promise<TokenResponse> {
@@ -1604,7 +1638,7 @@ async function refreshAccessToken(clientId: string, tenantId: string, refreshTok
   });
   if (response.status >= 400) {
     const json = response.json as unknown;
-    throw new Error(formatAadFailure("刷新令牌失败", json, response.status, response.text));
+    throw new Error(formatAadFailure("Failed to refresh token", json, response.status, response.text));
   }
   return response.json as TokenResponse;
 }
@@ -1632,16 +1666,16 @@ function formatGraphFailure(url: string, status: number, json: unknown, rawText?
     const code = typeof json.error.code === "string" ? json.error.code.trim() : "";
     const msg = typeof json.error.message === "string" ? json.error.message.trim() : "";
     const parts = [
-      "Graph 请求失败",
+      "Graph request failed",
       `HTTP ${status}`,
-      code ? `错误：${code}` : "",
-      msg ? `说明：${msg}` : "",
-      `接口：${url}`
+      code ? `Error: ${code}` : "",
+      msg ? `Description: ${msg}` : "",
+      `API: ${url}`
     ].filter(Boolean);
     return parts.join("\n");
   }
-  if (text) return `Graph 请求失败\nHTTP ${status}\n${text}\n接口：${url}`;
-  return `Graph 请求失败（HTTP ${status}）\n接口：${url}`;
+  if (text) return `Graph request failed\nHTTP ${status}\n${text}\nAPI: ${url}`;
+  return `Graph request failed (HTTP ${status})\nAPI: ${url}`;
 }
 
 function formatAadFailure(prefix: string, json: unknown, status?: number, rawText?: string): string {
@@ -1652,26 +1686,26 @@ function formatAadFailure(prefix: string, json: unknown, status?: number, rawTex
     const parts = [
       prefix,
       status ? `HTTP ${status}` : "",
-      json.error ? `错误：${json.error}` : "",
-      desc ? `说明：${desc}` : "",
-      hint ? `建议：${hint}` : ""
+      json.error ? `Error: ${json.error}` : "",
+      desc ? `Description: ${desc}` : "",
+      hint ? `Suggestion: ${hint}` : ""
     ].filter(Boolean);
     return parts.join("\n");
   }
   if (text) return `${prefix}\nHTTP ${status ?? ""}\n${text}`.trim();
-  return `${prefix}${status ? `（HTTP ${status}）` : ""}`;
+  return `${prefix}${status ? ` (HTTP ${status})` : ""}`;
 }
 
 function buildAadHint(code: string, description: string): string {
   const merged = `${code} ${description}`.toLowerCase();
   if (merged.includes("unauthorized_client") || merged.includes("public client") || merged.includes("7000218")) {
-    return "请在 Azure 应用注册 -> Authentication -> Advanced settings 中启用 Allow public client flows";
+    return "Please enable 'Allow public client flows' in Azure Portal -> Authentication";
   }
   if (merged.includes("invalid_scope")) {
-    return "请确认已添加 Microsoft Graph 委托权限 Tasks.ReadWrite 与 offline_access，并重新同意授权";
+    return "Please ensure 'Tasks.ReadWrite' and 'offline_access' permissions are added and granted";
   }
   if (merged.includes("interaction_required")) {
-    return "请重新执行登录/重新登录并在浏览器完成授权";
+    return "Please login again and authorize in browser";
   }
   return "";
 }
@@ -1683,15 +1717,15 @@ function normalizeErrorMessage(error: unknown): string {
   return "";
 }
 
-async function requestUrlNoThrow(params: { url: string; method?: string; headers?: Record<string, string>; body?: string }): Promise<{
+async function requestUrlNoThrow(params: RequestUrlParam): Promise<{
   status: number;
   text: string;
   json: unknown;
 }> {
-  const response = await requestUrl({ ...(params as any), throw: false } as any);
+  const response = await requestUrl({ ...params, throw: false });
   return {
     status: response.status,
-    text: (response.text ?? "") as string,
+    text: response.text ?? "",
     json: response.json as unknown
   };
 }
@@ -1707,11 +1741,12 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Obsidian-MicrosoftToDo-Link" });
+    
+    new Setting(containerEl).setName("Microsoft To Do Link").setHeading();
 
     new Setting(containerEl)
-      .setName("Azure 应用 Client ID")
-      .setDesc("在 Azure 门户中注册的公共客户端 ID")
+      .setName("Azure client ID")
+      .setDesc("Public client ID registered in Azure Portal")
       .addText(text =>
         text
           .setPlaceholder("00000000-0000-0000-0000-000000000000")
@@ -1723,8 +1758,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("租户 Tenant")
-      .setDesc("Tenant ID，个人账号可使用 common")
+      .setName("Tenant ID")
+      .setDesc("Tenant ID (use 'common' for personal accounts)")
       .addText(text =>
         text
           .setPlaceholder("common")
@@ -1735,61 +1770,61 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           })
       );
 
-    const loginSetting = new Setting(containerEl).setName("账号状态");
+    const loginSetting = new Setting(containerEl).setName("Account status");
     const statusEl = loginSetting.descEl.createDiv();
-    statusEl.style.marginTop = "6px";
+    statusEl.setCssProps({ marginTop: "6px" });
     const now = Date.now();
     const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 60_000;
     const canRefresh = Boolean(this.plugin.settings.refreshToken);
     if (tokenValid) {
-      statusEl.setText("已登录");
+      statusEl.setText("Logged in");
     } else if (canRefresh) {
-      statusEl.setText("已保存授权（将自动刷新令牌）");
+      statusEl.setText("Authorized (auto-refresh)");
     } else {
-      statusEl.setText("未登录");
+      statusEl.setText("Not logged in");
     }
 
     const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
     if (pending) {
       new Setting(containerEl)
-        .setName("设备登录代码")
-        .setDesc("复制代码到网页登录页面")
+        .setName("Device login code")
+        .setDesc("Copy code to login page")
         .addText(text => {
           text.setValue(pending.userCode);
           text.inputEl.readOnly = true;
         })
         .addButton(btn =>
-          btn.setButtonText("复制代码").onClick(async () => {
+          btn.setButtonText("Copy code").onClick(async () => {
             try {
               await navigator.clipboard.writeText(pending.userCode);
-              new Notice("已复制");
+              new Notice("Copied");
             } catch (error) {
               console.error(error);
-              new Notice("复制失败");
+              new Notice("Copy failed");
             }
           })
         )
         .addButton(btn =>
-          btn.setButtonText("打开登录网页").onClick(() => {
+          btn.setButtonText("Open login page").onClick(() => {
             try {
               window.open(pending.verificationUri, "_blank");
             } catch (error) {
               console.error(error);
-              new Notice("无法打开浏览器");
+              new Notice("Cannot open browser");
             }
           })
         );
     }
 
     new Setting(containerEl)
-      .setName("登录/退出")
-      .setDesc("登录将自动打开网页登录页面；退出会清除本地令牌")
+      .setName("Login / logout")
+      .setDesc("Login opens browser; logout clears local token")
       .addButton(btn =>
-        btn.setButtonText(this.plugin.isLoggedIn() ? "退出登录" : "登录").onClick(async () => {
+        btn.setButtonText(this.plugin.isLoggedIn() ? "Logout" : "Login").onClick(async () => {
           try {
             if (this.plugin.isLoggedIn()) {
               await this.plugin.logout();
-              new Notice("已退出登录");
+              new Notice("Logged out");
               this.display();
               return;
             }
@@ -1797,30 +1832,30 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           } catch (error) {
             const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice(message || "登录失败，详细信息请查看控制台");
+            new Notice(message || "Login failed, check console");
             this.display();
           }
         })
       );
 
     new Setting(containerEl)
-      .setName("默认 Microsoft To Do 列表")
-      .setDesc("未单独配置的文件将使用该列表")
+      .setName("Default Microsoft To Do list")
+      .setDesc("Used when no specific list is configured")
       .addButton(btn =>
-        btn.setButtonText("选择列表").onClick(async () => {
+        btn.setButtonText("Select list").onClick(async () => {
           try {
             await this.plugin.selectDefaultListWithUi();
             this.display();
           } catch (error) {
             const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice(message || "加载列表失败，详细信息请查看控制台");
+            new Notice(message || "Failed to load lists, check console");
           }
         })
       )
       .addText(text =>
         text
-          .setPlaceholder("列表 ID（可选）")
+          .setPlaceholder("List ID (optional)")
           .setValue(this.plugin.settings.defaultListId)
           .onChange(async value => {
             this.plugin.settings.defaultListId = value.trim();
@@ -1829,13 +1864,13 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("立即同步")
-      .setDesc("一键执行完整同步（优先拉取 To Do 的未完成任务）")
-      .addButton(btn => btn.setButtonText("同步当前文件").onClick(async () => await this.plugin.syncCurrentFileNow()));
+      .setName("Sync now")
+      .setDesc("Full sync (pulls incomplete tasks first)")
+      .addButton(btn => btn.setButtonText("Sync current file").onClick(async () => await this.plugin.syncCurrentFileNow()));
 
     new Setting(containerEl)
-      .setName("自动同步")
-      .setDesc("按固定间隔同步已绑定列表的文件")
+      .setName("Auto sync")
+      .setDesc("Sync mapped files periodically")
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async value => {
           this.plugin.settings.autoSyncEnabled = value;
@@ -1845,8 +1880,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("自动同步间隔（分钟）")
-      .setDesc("最小 1 分钟")
+      .setName("Auto sync interval (minutes)")
+      .setDesc("Minimum 1 minute")
       .addText(text =>
         text.setValue(String(this.plugin.settings.autoSyncIntervalMinutes)).onChange(async value => {
           const num = Number.parseInt(value, 10);
@@ -1857,13 +1892,13 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("删除策略")
-      .setDesc("从笔记删除已同步任务时，对 Microsoft To Do 的处理方式")
+      .setName("Deletion policy")
+      .setDesc("Action when a synced task is deleted from note")
       .addDropdown(dropdown => {
         dropdown
-          .addOption("complete", "标记为已完成（推荐）")
-          .addOption("delete", "删除 Microsoft To Do 任务")
-          .addOption("detach", "仅解除绑定（不改云端）")
+          .addOption("complete", "Mark as completed (recommended)")
+          .addOption("delete", "Delete task in Microsoft To Do")
+          .addOption("detach", "Detach only (keep remote task)")
           .setValue(this.plugin.settings.deletionPolicy || "complete")
           .onChange(async value => {
             const normalized = value === "delete" || value === "detach" ? value : "complete";
@@ -1873,15 +1908,15 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("当前文件列表绑定")
-      .setDesc("为当前打开的 Markdown 文件选择列表")
+      .setName("Current file list binding")
+      .setDesc("Select list for active file")
       .addButton(btn =>
-        btn.setButtonText("为当前文件选择列表").onClick(async () => {
+        btn.setButtonText("Select list").onClick(async () => {
           await this.plugin.selectListForCurrentFile();
         })
       )
       .addButton(btn =>
-        btn.setButtonText("清除当前文件同步状态").onClick(async () => {
+        btn.setButtonText("Clear sync state").onClick(async () => {
           await this.plugin.clearSyncStateForCurrentFile();
         })
       );
