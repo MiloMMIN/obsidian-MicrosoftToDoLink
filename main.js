@@ -35,7 +35,13 @@ var DEFAULT_SETTINGS = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
-  deletionPolicy: "complete"
+  deletionPolicy: "complete",
+  pullGroupUnderHeading: false,
+  pullHeadingText: "Microsoft To Do",
+  pullHeadingLevel: 2,
+  pullInsertLocation: "bottom",
+  pullAppendTagEnabled: false,
+  pullAppendTag: "MicrosoftTodo"
 };
 var BLOCK_ID_PREFIX = "mtd_";
 var CHECKLIST_BLOCK_ID_PREFIX = "mtdc_";
@@ -489,9 +495,9 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     if (newTasks.length === 0) return 0;
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    const hadTrailingBlank = lines.length > 0 && lines[lines.length - 1].trim().length === 0;
-    if (!hadTrailingBlank) lines.push("");
-    lines.push("");
+    const insertAt = this.resolvePullInsertIndex(lines, file);
+    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    const insertLines = [];
     const fileMtime = file.stat.mtime;
     let added = 0;
     for (const task of newTasks) {
@@ -501,8 +507,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       if (!title) continue;
       const completed = graphStatusToCompleted(task.status);
       const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${blockId} -->`;
-      lines.push(line);
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, tagForPull)} <!-- mtd:${blockId} -->`;
+      insertLines.push(line);
       const mappingKey = buildMappingKey(file.path, blockId);
       const localHash = hashTask(title, completed, dueDate);
       const graphHash = hashGraphTask(task);
@@ -524,8 +530,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           const displayName = sanitizeTitleForGraph((item.displayName || "").trim());
           if (!displayName) continue;
           const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-          const childLine = `  - [${item.isChecked ? "x" : " "}] ${displayName} <!-- mtd:${childBlockId} -->`;
-          lines.push(childLine);
+          const childLine = `  - [${item.isChecked ? "x" : " "}] ${buildMarkdownTaskText(displayName, void 0, tagForPull)} <!-- mtd:${childBlockId} -->`;
+          insertLines.push(childLine);
           const childKey = buildMappingKey(file.path, childBlockId);
           const childLocalHash = hashChecklist(displayName, item.isChecked);
           const childGraphHash = hashChecklist(displayName, item.isChecked);
@@ -547,6 +553,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       }
     }
     if (added > 0) {
+      lines.splice(insertAt, 0, ...insertLines);
       await this.app.vault.modify(file, lines.join("\n"));
       await this.saveDataModel();
       if (syncAfter) {
@@ -559,7 +566,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     await this.getValidAccessToken();
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    let tasks = parseMarkdownTasks(lines);
+    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     if (tasks.length === 0) return 0;
     let changed = false;
     const ensured = ensureBlockIds(lines, tasks);
@@ -641,7 +649,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         if (!name) continue;
         if (localChildTitles.has(name)) continue;
         const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-        toInsert.push(`  - [ ] ${name} <!-- mtd:${childBlockId} -->`);
+        toInsert.push(`  - [ ] ${buildMarkdownTaskText(name, void 0, tagForPull)} <!-- mtd:${childBlockId} -->`);
         const ck = buildMappingKey(file.path, childBlockId);
         this.dataModel.checklistMappings[ck] = {
           listId: parentEntry.listId,
@@ -689,7 +697,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     }
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    let tasks = parseMarkdownTasks(lines);
+    let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     const mappingPrefix = `${file.path}::`;
     if (tasks.length === 0) {
       const removedMappings2 = Object.keys(this.dataModel.taskMappings).filter((key) => key.startsWith(mappingPrefix));
@@ -870,7 +878,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
           continue;
         }
         if (!localChanged2 && graphChanged2) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${remote2.displayName} ^${task.blockId}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote2.displayName, void 0, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -889,7 +897,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         const graphTime2 = remote2.lastModifiedDateTime ? Date.parse(remote2.lastModifiedDateTime) : 0;
         const localTime2 = fileMtime;
         if (graphTime2 > localTime2) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${remote2.displayName} ^${task.blockId}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote2.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote2.displayName, void 0, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -1098,6 +1106,140 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
     return (_a = activeView == null ? void 0 : activeView.file) != null ? _a : null;
   }
+  getCursorLineForFile(file) {
+    const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+    if (!view || !view.file || view.file.path !== file.path) return null;
+    return view.editor.getCursor().line;
+  }
+  getPullTagNamesToPreserve() {
+    const tags = [this.settings.pullAppendTag, DEFAULT_SETTINGS.pullAppendTag].map((t) => (t || "").trim()).filter(Boolean).map((t) => t.startsWith("#") ? t.slice(1) : t);
+    return Array.from(new Set(tags));
+  }
+  findFrontMatterEnd(lines) {
+    if ((lines[0] || "").trim() !== "---") return 0;
+    for (let i = 1; i < lines.length; i++) {
+      if ((lines[i] || "").trim() === "---") return i + 1;
+    }
+    return 0;
+  }
+  findPullHeadingLine(lines, headingText, headingLevel) {
+    const text = headingText.trim();
+    if (!text) return -1;
+    const hashes = "#".repeat(Math.min(6, Math.max(1, Math.floor(headingLevel || 2))));
+    const pattern = new RegExp(`^${escapeRegExp(hashes)}\\s+${escapeRegExp(text)}\\s*$`);
+    const candidateLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (pattern.test(lines[i] || "")) candidateLines.push(i);
+    }
+    if (candidateLines.length === 0) return -1;
+    if (candidateLines.length === 1) return candidateLines[0];
+    const markerPattern = /<!--\s*mtd\s*:/i;
+    const sectionEndOf = (headingLine) => {
+      const nextHeading = /^(#{1,6})\s+/;
+      for (let i = headingLine + 1; i < lines.length; i++) {
+        const m = nextHeading.exec(lines[i] || "");
+        if (!m) continue;
+        const level = m[1].length;
+        if (level <= headingLevel) return i;
+      }
+      return lines.length;
+    };
+    let bestLine = candidateLines[0];
+    let bestScore = -1;
+    for (const headingLine of candidateLines) {
+      const end = sectionEndOf(headingLine);
+      let score = 0;
+      for (let i = headingLine + 1; i < end; i++) {
+        if (markerPattern.test(lines[i] || "")) score++;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestLine = headingLine;
+      }
+    }
+    return bestScore > 0 ? bestLine : candidateLines[0];
+  }
+  resolveBaseInsertIndex(lines, file, location) {
+    if (location === "cursor") {
+      const cursorLine = this.getCursorLineForFile(file);
+      if (cursorLine !== null) return Math.min(lines.length, Math.max(0, cursorLine));
+      return lines.length;
+    }
+    if (location === "top") {
+      return this.findFrontMatterEnd(lines);
+    }
+    return lines.length;
+  }
+  resolvePullInsertIndex(lines, file) {
+    const location = this.settings.pullInsertLocation || "bottom";
+    if (!this.settings.pullGroupUnderHeading) {
+      const normalizedLocation = location === "existing_group" ? "bottom" : location;
+      const index = this.resolveBaseInsertIndex(lines, file, normalizedLocation);
+      if (normalizedLocation === "bottom") {
+        const last = lines.length > 0 ? lines[lines.length - 1] : "";
+        if (index === lines.length && last.trim().length > 0) {
+          lines.push("");
+          return lines.length;
+        }
+      }
+      if (normalizedLocation === "top") {
+        if (index < lines.length && (lines[index] || "").trim().length > 0) {
+          lines.splice(index, 0, "");
+          return index + 1;
+        }
+      }
+      return index;
+    }
+    const headingText = (this.settings.pullHeadingText || DEFAULT_SETTINGS.pullHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
+    const headingLevel = Math.min(6, Math.max(1, Math.floor(this.settings.pullHeadingLevel || DEFAULT_SETTINGS.pullHeadingLevel)));
+    let headingLine = this.findPullHeadingLine(lines, headingText, headingLevel);
+    if (headingLine < 0) {
+      const creationLocation = location === "existing_group" ? "bottom" : location;
+      let insertAt = this.resolveBaseInsertIndex(lines, file, creationLocation);
+      if (insertAt > 0 && (lines[insertAt - 1] || "").trim().length > 0) {
+        lines.splice(insertAt, 0, "");
+        insertAt++;
+      }
+      const heading = `${"#".repeat(headingLevel)} ${headingText}`;
+      lines.splice(insertAt, 0, heading);
+      headingLine = insertAt;
+      if (headingLine + 1 >= lines.length || (lines[headingLine + 1] || "").trim().length > 0) {
+        lines.splice(headingLine + 1, 0, "");
+      }
+    } else {
+      if (headingLine + 1 >= lines.length || (lines[headingLine + 1] || "").trim().length > 0) {
+        lines.splice(headingLine + 1, 0, "");
+      }
+    }
+    const sectionStart = headingLine + 1;
+    let sectionEnd = lines.length;
+    const nextHeading = /^(#{1,6})\s+/;
+    for (let i = headingLine + 1; i < lines.length; i++) {
+      const m = nextHeading.exec(lines[i] || "");
+      if (!m) continue;
+      const level = m[1].length;
+      if (level <= headingLevel) {
+        sectionEnd = i;
+        break;
+      }
+    }
+    if (location === "existing_group") {
+      return sectionEnd;
+    }
+    if (location === "top") {
+      let i = sectionStart;
+      while (i < sectionEnd && (lines[i] || "").trim().length === 0) i++;
+      return i;
+    }
+    if (location === "cursor") {
+      const cursorLine = this.getCursorLineForFile(file);
+      if (cursorLine !== null && cursorLine >= sectionStart && cursorLine <= sectionEnd) {
+        return cursorLine;
+      }
+      return sectionEnd;
+    }
+    return sectionEnd;
+  }
   async openListPicker(lists, selectedId) {
     return await new Promise((resolve) => {
       const modal = new ListSelectModal(this.app, lists, selectedId, resolve);
@@ -1119,6 +1261,10 @@ function migrateDataModel(raw) {
     const deletionPolicyRaw = settingsRaw.deletionPolicy;
     const deleteRemoteWhenRemovedRaw = settingsRaw.deleteRemoteWhenRemoved;
     const deletionPolicy = deletionPolicyRaw === "delete" || deletionPolicyRaw === "detach" || deletionPolicyRaw === "complete" ? deletionPolicyRaw : deleteRemoteWhenRemovedRaw === true ? "delete" : "complete";
+    const pullInsertLocationRaw = settingsRaw.pullInsertLocation;
+    const pullInsertLocation = pullInsertLocationRaw === "cursor" || pullInsertLocationRaw === "top" || pullInsertLocationRaw === "bottom" || pullInsertLocationRaw === "existing_group" ? pullInsertLocationRaw : DEFAULT_SETTINGS.pullInsertLocation;
+    const headingLevelRaw = settingsRaw.pullHeadingLevel;
+    const pullHeadingLevel = typeof headingLevelRaw === "number" && Number.isFinite(headingLevelRaw) ? Math.min(6, Math.max(1, Math.floor(headingLevelRaw))) : 2;
     const migratedSettings = {
       ...DEFAULT_SETTINGS,
       clientId: typeof settingsRaw.clientId === "string" ? settingsRaw.clientId : DEFAULT_SETTINGS.clientId,
@@ -1129,7 +1275,13 @@ function migrateDataModel(raw) {
       accessTokenExpiresAt: typeof settingsRaw.accessTokenExpiresAt === "number" ? settingsRaw.accessTokenExpiresAt : DEFAULT_SETTINGS.accessTokenExpiresAt,
       autoSyncEnabled: typeof settingsRaw.autoSyncEnabled === "boolean" ? settingsRaw.autoSyncEnabled : DEFAULT_SETTINGS.autoSyncEnabled,
       autoSyncIntervalMinutes: typeof settingsRaw.autoSyncIntervalMinutes === "number" ? settingsRaw.autoSyncIntervalMinutes : DEFAULT_SETTINGS.autoSyncIntervalMinutes,
-      deletionPolicy
+      deletionPolicy,
+      pullGroupUnderHeading: typeof settingsRaw.pullGroupUnderHeading === "boolean" ? settingsRaw.pullGroupUnderHeading : DEFAULT_SETTINGS.pullGroupUnderHeading,
+      pullHeadingText: typeof settingsRaw.pullHeadingText === "string" ? settingsRaw.pullHeadingText : DEFAULT_SETTINGS.pullHeadingText,
+      pullHeadingLevel,
+      pullInsertLocation,
+      pullAppendTagEnabled: typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
+      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag
     };
     return {
       settings: migratedSettings,
@@ -1161,12 +1313,21 @@ function migrateDataModel(raw) {
     checklistMappings
   };
 }
-function parseMarkdownTasks(lines) {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function parseMarkdownTasks(lines, tagNamesToPreserve = []) {
   var _a, _b, _c, _d;
   const tasks = [];
   const taskPattern = /^(\s*)([-*])\s+\[([ xX])\]\s+(.*)$/;
   const blockIdCaretPattern = /\s+\^([a-z0-9_]+)\s*$/i;
   const blockIdCommentPattern = /\s*<!--\s*mtd\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
+  const normalizedTags = Array.from(
+    new Set(
+      tagNamesToPreserve.map((t) => (t || "").trim()).filter(Boolean).map((t) => t.startsWith("#") ? t.slice(1) : t)
+    )
+  );
+  const tagRegex = normalizedTags.length > 0 ? new RegExp(String.raw`(?:^|\s)#(${normalizedTags.map(escapeRegExp).join("|")})(?=\s*$)`) : null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = taskPattern.exec(line);
@@ -1180,8 +1341,11 @@ function parseMarkdownTasks(lines) {
     const caretMatch = commentMatch ? null : blockIdCaretPattern.exec(rest);
     const markerMatch = commentMatch || caretMatch;
     const existingBlockId = markerMatch ? markerMatch[1] : "";
-    const rawTitle = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
-    if (!rawTitle) continue;
+    const rawTitleWithTag = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
+    if (!rawTitleWithTag) continue;
+    const tagMatch = tagRegex ? tagRegex.exec(rawTitleWithTag) : null;
+    const mtdTag = tagMatch ? `#${tagMatch[1]}` : void 0;
+    const rawTitle = tagMatch ? rawTitleWithTag.slice(0, tagMatch.index).trim() : rawTitleWithTag;
     const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
     const blockId = existingBlockId && (existingBlockId.startsWith(BLOCK_ID_PREFIX) || existingBlockId.startsWith(CHECKLIST_BLOCK_ID_PREFIX)) ? existingBlockId : "";
@@ -1192,7 +1356,8 @@ function parseMarkdownTasks(lines) {
       completed,
       title,
       dueDate,
-      blockId
+      blockId,
+      mtdTag
     });
   }
   return tasks;
@@ -1212,7 +1377,7 @@ function ensureBlockIds(lines, tasks) {
     }
     const prefix = isNested ? CHECKLIST_BLOCK_ID_PREFIX : BLOCK_ID_PREFIX;
     const newBlockId = `${prefix}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} <!-- mtd:${newBlockId} -->`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} <!-- mtd:${newBlockId} -->`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
@@ -1221,7 +1386,7 @@ function ensureBlockIds(lines, tasks) {
   return { tasks: updated, changed };
 }
 function formatTaskLine(task, title, completed, dueDate) {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${task.blockId} -->`;
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
 }
 function randomId(length) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -1261,11 +1426,14 @@ function sanitizeTitleForGraph(title) {
   const withoutIds = input.replace(/\^mtdc?_[a-z0-9_]+/gi, " ").replace(/<!--\s*mtd\s*:\s*mtdc?_[a-z0-9_]+\s*-->/gi, " ").replace(/\s{2,}/g, " ").trim();
   return withoutIds;
 }
-function buildMarkdownTaskTitle(title, dueDate) {
-  const trimmed = (title || "").trim();
-  if (!trimmed) return trimmed;
-  if (!dueDate) return trimmed;
-  return `${trimmed} \u{1F4C5} ${dueDate}`;
+function buildMarkdownTaskText(title, dueDate, tag) {
+  const trimmedTitle = (title || "").trim();
+  if (!trimmedTitle) return trimmedTitle;
+  const base = dueDate ? `${trimmedTitle} \u{1F4C5} ${dueDate}` : trimmedTitle;
+  const normalizedTag = (tag || "").trim();
+  if (!normalizedTag) return base;
+  const token = normalizedTag.startsWith("#") ? normalizedTag : `#${normalizedTag}`;
+  return `${base} ${token}`;
 }
 function extractDueFromMarkdownTitle(rawTitle) {
   const input = (rawTitle || "").trim();
@@ -1470,69 +1638,137 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     __publicField(this, "plugin");
+    __publicField(this, "t");
     this.plugin = plugin;
+    const lang = (navigator.language || "en").toLowerCase();
+    const isZh = lang.startsWith("zh");
+    const dict = {
+      heading_main: isZh ? "Microsoft To Do \u94FE\u63A5" : "Microsoft To Do Link",
+      azure_client_id: isZh ? "Azure \u5BA2\u6237\u7AEF ID" : "Azure client ID",
+      azure_client_desc: isZh ? "\u5728 Azure Portal \u6CE8\u518C\u7684\u516C\u5171\u5BA2\u6237\u7AEF ID" : "Public client ID registered in Azure Portal",
+      tenant_id: isZh ? "\u79DF\u6237 ID" : "Tenant ID",
+      tenant_id_desc: isZh ? "\u79DF\u6237 ID\uFF08\u4E2A\u4EBA\u8D26\u6237\u4F7F\u7528 common\uFF09" : "Tenant ID (use 'common' for personal accounts)",
+      account_status: isZh ? "\u8D26\u53F7\u72B6\u6001" : "Account status",
+      logged_in: isZh ? "\u5DF2\u767B\u5F55" : "Logged in",
+      authorized_refresh: isZh ? "\u5DF2\u6388\u6743\uFF08\u81EA\u52A8\u5237\u65B0\uFF09" : "Authorized (auto-refresh)",
+      not_logged_in: isZh ? "\u672A\u767B\u5F55" : "Not logged in",
+      device_code: isZh ? "\u8BBE\u5907\u767B\u5F55\u4EE3\u7801" : "Device login code",
+      device_code_desc: isZh ? "\u590D\u5236\u4EE3\u7801\u5E76\u5728\u767B\u5F55\u9875\u9762\u4E2D\u8F93\u5165" : "Copy code to login page",
+      copy_code: isZh ? "\u590D\u5236\u4EE3\u7801" : "Copy code",
+      open_login_page: isZh ? "\u6253\u5F00\u767B\u5F55\u9875\u9762" : "Open login page",
+      cannot_open_browser: isZh ? "\u65E0\u6CD5\u6253\u5F00\u6D4F\u89C8\u5668" : "Cannot open browser",
+      copied: isZh ? "\u5DF2\u590D\u5236" : "Copied",
+      copy_failed: isZh ? "\u590D\u5236\u5931\u8D25" : "Copy failed",
+      login_logout: isZh ? "\u767B\u5F55 / \u767B\u51FA" : "Login / logout",
+      login_logout_desc: isZh ? "\u767B\u5F55\u5C06\u6253\u5F00\u6D4F\u89C8\u5668\uFF1B\u767B\u51FA\u4F1A\u6E05\u9664\u672C\u5730\u4EE4\u724C" : "Login opens browser; logout clears local token",
+      login: isZh ? "\u767B\u5F55" : "Login",
+      logout: isZh ? "\u767B\u51FA" : "Logout",
+      logged_out: isZh ? "\u5DF2\u767B\u51FA" : "Logged out",
+      login_failed: isZh ? "\u767B\u5F55\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0" : "Login failed, check console",
+      default_list: isZh ? "\u9ED8\u8BA4 Microsoft To Do \u5217\u8868" : "Default Microsoft To Do list",
+      default_list_desc: isZh ? "\u5F53\u672A\u914D\u7F6E\u7279\u5B9A\u5217\u8868\u65F6\u4F7F\u7528\u8BE5\u5217\u8868" : "Used when no specific list is configured",
+      select_list: isZh ? "\u9009\u62E9\u5217\u8868" : "Select list",
+      load_list_failed: isZh ? "\u52A0\u8F7D\u5217\u8868\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0" : "Failed to load lists, check console",
+      list_id_placeholder: isZh ? "\u5217\u8868 ID\uFF08\u53EF\u9009\uFF09" : "List ID (optional)",
+      pull_options_heading: isZh ? "\u62C9\u53D6\u9009\u9879" : "Pull options",
+      pull_insert: isZh ? "\u62C9\u53D6\u4EFB\u52A1\u63D2\u5165\u4F4D\u7F6E" : "Pulled task insertion",
+      pull_insert_desc: isZh ? "\u4ECE Microsoft To Do \u62C9\u53D6\u7684\u65B0\u4EFB\u52A1\u63D2\u5165\u4F4D\u7F6E" : "Where to insert new tasks pulled from Microsoft To Do",
+      at_cursor: isZh ? "\u5149\u6807\u5904" : "At cursor",
+      top_of_file: isZh ? "\u6587\u6863\u6700\u4E0A" : "Top of file",
+      bottom_of_file: isZh ? "\u6587\u6863\u6700\u4E0B" : "Bottom of file",
+      existing_group: isZh ? "\u539F\u5148\u5206\u7EC4\u5904" : "Existing group section",
+      group_heading: isZh ? "\u5728\u6807\u9898\u4E0B\u5206\u7EC4\u5B58\u653E" : "Group pulled tasks under heading",
+      group_heading_desc: isZh ? "\u628A\u62C9\u53D6\u7684\u4EFB\u52A1\u96C6\u4E2D\u63D2\u5165\u5230\u6307\u5B9A\u6807\u9898\u533A" : "Insert pulled tasks into a dedicated section",
+      pull_heading_text: isZh ? "\u5206\u7EC4\u6807\u9898\u6587\u672C" : "Pull section heading",
+      pull_heading_text_desc: isZh ? "\u542F\u7528\u5206\u7EC4\u65F6\u4F7F\u7528\u7684\u6807\u9898\u6587\u672C" : "Heading text used when grouping is enabled",
+      pull_heading_level: isZh ? "\u5206\u7EC4\u6807\u9898\u7EA7\u522B" : "Pull section heading level",
+      pull_heading_level_desc: isZh ? "\u542F\u7528\u5206\u7EC4\u65F6\u4F7F\u7528\u7684\u6807\u9898\u7EA7\u522B" : "Heading level used when grouping is enabled",
+      append_tag: isZh ? "\u62C9\u53D6\u65F6\u8FFD\u52A0\u6807\u7B7E" : "Append tag on pull",
+      append_tag_desc: isZh ? "\u4E3A\u4ECE Microsoft To Do \u62C9\u53D6\u7684\u4EFB\u52A1\u8FFD\u52A0\u6807\u7B7E" : "Append a tag to tasks pulled from Microsoft To Do",
+      pull_tag_name: isZh ? "\u62C9\u53D6\u6807\u7B7E\u540D\u79F0" : "Pull tag name",
+      pull_tag_name_desc: isZh ? "\u4E0D\u542B # \u7684\u6807\u7B7E\u540D\uFF0C\u8FFD\u52A0\u5230\u62C9\u53D6\u4EFB\u52A1\u672B\u5C3E" : "Tag without '#', appended to pulled tasks",
+      sync_now: isZh ? "\u7ACB\u5373\u540C\u6B65" : "Sync now",
+      sync_now_desc: isZh ? "\u5B8C\u6574\u540C\u6B65\uFF08\u4F18\u5148\u62C9\u53D6\u672A\u5B8C\u6210\u4EFB\u52A1\uFF09" : "Full sync (pulls incomplete tasks first)",
+      sync_current_file: isZh ? "\u540C\u6B65\u5F53\u524D\u6587\u4EF6" : "Sync current file",
+      auto_sync: isZh ? "\u81EA\u52A8\u540C\u6B65" : "Auto sync",
+      auto_sync_desc: isZh ? "\u5468\u671F\u6027\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6" : "Sync mapped files periodically",
+      auto_sync_interval: isZh ? "\u81EA\u52A8\u540C\u6B65\u95F4\u9694\uFF08\u5206\u949F\uFF09" : "Auto sync interval (minutes)",
+      auto_sync_interval_desc: isZh ? "\u81F3\u5C11 1 \u5206\u949F" : "Minimum 1 minute",
+      deletion_policy: isZh ? "\u5220\u9664\u7B56\u7565" : "Deletion policy",
+      deletion_policy_desc: isZh ? "\u5220\u9664\u7B14\u8BB0\u4E2D\u5DF2\u540C\u6B65\u4EFB\u52A1\u65F6\u7684\u4E91\u7AEF\u52A8\u4F5C" : "Action when a synced task is deleted from note",
+      deletion_complete: isZh ? "\u6807\u8BB0\u5B8C\u6210\uFF08\u63A8\u8350\uFF09" : "Mark as completed (recommended)",
+      deletion_delete: isZh ? "\u5220\u9664\uFF08Microsoft To Do\uFF09" : "Delete task in Microsoft To Do",
+      deletion_detach: isZh ? "\u4EC5\u89E3\u9664\u7ED1\u5B9A\uFF08\u4FDD\u7559\u4E91\u7AEF\u4EFB\u52A1\uFF09" : "Detach only (keep remote task)",
+      current_file_binding: isZh ? "\u5F53\u524D\u6587\u4EF6\u5217\u8868\u7ED1\u5B9A" : "Current file list binding",
+      current_file_binding_desc: isZh ? "\u4E3A\u5F53\u524D\u6D3B\u52A8\u6587\u4EF6\u9009\u62E9\u5217\u8868" : "Select list for active file",
+      clear_sync_state: isZh ? "\u6E05\u9664\u540C\u6B65\u72B6\u6001" : "Clear sync state"
+    };
+    this.t = (key) => {
+      var _a;
+      return (_a = dict[key]) != null ? _a : key;
+    };
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Microsoft To Do Link").setHeading();
-    new import_obsidian.Setting(containerEl).setName("Azure client ID").setDesc("Public client ID registered in Azure Portal").addText(
+    new import_obsidian.Setting(containerEl).setName(this.t("heading_main")).setHeading();
+    new import_obsidian.Setting(containerEl).setName(this.t("azure_client_id")).setDesc(this.t("azure_client_desc")).addText(
       (text) => text.setPlaceholder("00000000-0000-0000-0000-000000000000").setValue(this.plugin.settings.clientId).onChange(async (value) => {
         this.plugin.settings.clientId = value.trim();
         await this.plugin.saveDataModel();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Tenant ID").setDesc("Tenant ID (use 'common' for personal accounts)").addText(
+    new import_obsidian.Setting(containerEl).setName(this.t("tenant_id")).setDesc(this.t("tenant_id_desc")).addText(
       (text) => text.setPlaceholder("common").setValue(this.plugin.settings.tenantId).onChange(async (value) => {
         this.plugin.settings.tenantId = value.trim() || "common";
         await this.plugin.saveDataModel();
       })
     );
-    const loginSetting = new import_obsidian.Setting(containerEl).setName("Account status");
+    const loginSetting = new import_obsidian.Setting(containerEl).setName(this.t("account_status"));
     const statusEl = loginSetting.descEl.createDiv();
     statusEl.setCssProps({ marginTop: "6px" });
     const now = Date.now();
     const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 6e4;
     const canRefresh = Boolean(this.plugin.settings.refreshToken);
     if (tokenValid) {
-      statusEl.setText("Logged in");
+      statusEl.setText(this.t("logged_in"));
     } else if (canRefresh) {
-      statusEl.setText("Authorized (auto-refresh)");
+      statusEl.setText(this.t("authorized_refresh"));
     } else {
-      statusEl.setText("Not logged in");
+      statusEl.setText(this.t("not_logged_in"));
     }
     const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
     if (pending) {
-      new import_obsidian.Setting(containerEl).setName("Device login code").setDesc("Copy code to login page").addText((text) => {
+      new import_obsidian.Setting(containerEl).setName(this.t("device_code")).setDesc(this.t("device_code_desc")).addText((text) => {
         text.setValue(pending.userCode);
         text.inputEl.readOnly = true;
       }).addButton(
-        (btn) => btn.setButtonText("Copy code").onClick(async () => {
+        (btn) => btn.setButtonText(this.t("copy_code")).onClick(async () => {
           try {
             await navigator.clipboard.writeText(pending.userCode);
-            new import_obsidian.Notice("Copied");
+            new import_obsidian.Notice(this.t("copied"));
           } catch (error) {
             console.error(error);
-            new import_obsidian.Notice("Copy failed");
+            new import_obsidian.Notice(this.t("copy_failed"));
           }
         })
       ).addButton(
-        (btn) => btn.setButtonText("Open login page").onClick(() => {
+        (btn) => btn.setButtonText(this.t("open_login_page")).onClick(() => {
           try {
             window.open(pending.verificationUri, "_blank");
           } catch (error) {
             console.error(error);
-            new import_obsidian.Notice("Cannot open browser");
+            new import_obsidian.Notice(this.t("cannot_open_browser"));
           }
         })
       );
     }
-    new import_obsidian.Setting(containerEl).setName("Login / logout").setDesc("Login opens browser; logout clears local token").addButton(
-      (btn) => btn.setButtonText(this.plugin.isLoggedIn() ? "Logout" : "Login").onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName(this.t("login_logout")).setDesc(this.t("login_logout_desc")).addButton(
+      (btn) => btn.setButtonText(this.plugin.isLoggedIn() ? this.t("logout") : this.t("login")).onClick(async () => {
         try {
           if (this.plugin.isLoggedIn()) {
             await this.plugin.logout();
-            new import_obsidian.Notice("Logged out");
+            new import_obsidian.Notice(this.t("logged_out"));
             this.display();
             return;
           }
@@ -1540,37 +1776,87 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         } catch (error) {
           const message = normalizeErrorMessage(error);
           console.error(error);
-          new import_obsidian.Notice(message || "Login failed, check console");
+          new import_obsidian.Notice(message || this.t("login_failed"));
           this.display();
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Default Microsoft To Do list").setDesc("Used when no specific list is configured").addButton(
-      (btn) => btn.setButtonText("Select list").onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName(this.t("default_list")).setDesc(this.t("default_list_desc")).addButton(
+      (btn) => btn.setButtonText(this.t("select_list")).onClick(async () => {
         try {
           await this.plugin.selectDefaultListWithUi();
           this.display();
         } catch (error) {
           const message = normalizeErrorMessage(error);
           console.error(error);
-          new import_obsidian.Notice(message || "Failed to load lists, check console");
+          new import_obsidian.Notice(message || this.t("load_list_failed"));
         }
       })
     ).addText(
-      (text) => text.setPlaceholder("List ID (optional)").setValue(this.plugin.settings.defaultListId).onChange(async (value) => {
+      (text) => text.setPlaceholder(this.t("list_id_placeholder")).setValue(this.plugin.settings.defaultListId).onChange(async (value) => {
         this.plugin.settings.defaultListId = value.trim();
         await this.plugin.saveDataModel();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Sync now").setDesc("Full sync (pulls incomplete tasks first)").addButton((btn) => btn.setButtonText("Sync current file").onClick(async () => await this.plugin.syncCurrentFileNow()));
-    new import_obsidian.Setting(containerEl).setName("Auto sync").setDesc("Sync mapped files periodically").addToggle(
+    new import_obsidian.Setting(containerEl).setName(this.t("pull_options_heading")).setHeading();
+    new import_obsidian.Setting(containerEl).setName(this.t("pull_insert")).setDesc(this.t("pull_insert_desc")).addDropdown((dropdown) => {
+      dropdown.addOption("cursor", this.t("at_cursor")).addOption("top", this.t("top_of_file")).addOption("bottom", this.t("bottom_of_file")).addOption("existing_group", this.t("existing_group")).setValue(this.plugin.settings.pullInsertLocation).onChange(async (value) => {
+        const normalized = value === "cursor" || value === "top" || value === "existing_group" ? value : "bottom";
+        this.plugin.settings.pullInsertLocation = normalized;
+        await this.plugin.saveDataModel();
+      });
+      const option = Array.from(dropdown.selectEl.options).find((o) => o.value === "existing_group");
+      if (option) option.disabled = !this.plugin.settings.pullGroupUnderHeading;
+      if (!this.plugin.settings.pullGroupUnderHeading && this.plugin.settings.pullInsertLocation === "existing_group") {
+        this.plugin.settings.pullInsertLocation = "bottom";
+        void this.plugin.saveDataModel();
+        dropdown.setValue("bottom");
+      }
+    });
+    new import_obsidian.Setting(containerEl).setName(this.t("group_heading")).setDesc(this.t("group_heading_desc")).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.pullGroupUnderHeading).onChange(async (value) => {
+        this.plugin.settings.pullGroupUnderHeading = value;
+        if (!value && this.plugin.settings.pullInsertLocation === "existing_group") {
+          this.plugin.settings.pullInsertLocation = "bottom";
+        }
+        await this.plugin.saveDataModel();
+        this.display();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(this.t("pull_heading_text")).setDesc(this.t("pull_heading_text_desc")).addText(
+      (text) => text.setValue(this.plugin.settings.pullHeadingText).onChange(async (value) => {
+        this.plugin.settings.pullHeadingText = value.trim() || DEFAULT_SETTINGS.pullHeadingText;
+        await this.plugin.saveDataModel();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(this.t("pull_heading_level")).setDesc(this.t("pull_heading_level_desc")).addDropdown((dropdown) => {
+      dropdown.addOption("1", "H1").addOption("2", "H2").addOption("3", "H3").addOption("4", "H4").addOption("5", "H5").addOption("6", "H6").setValue(String(this.plugin.settings.pullHeadingLevel || DEFAULT_SETTINGS.pullHeadingLevel)).onChange(async (value) => {
+        const num = Number.parseInt(value, 10);
+        this.plugin.settings.pullHeadingLevel = Number.isFinite(num) ? Math.min(6, Math.max(1, num)) : DEFAULT_SETTINGS.pullHeadingLevel;
+        await this.plugin.saveDataModel();
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName(this.t("append_tag")).setDesc(this.t("append_tag_desc")).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.pullAppendTagEnabled).onChange(async (value) => {
+        this.plugin.settings.pullAppendTagEnabled = value;
+        await this.plugin.saveDataModel();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(this.t("pull_tag_name")).setDesc(this.t("pull_tag_name_desc")).addText(
+      (text) => text.setPlaceholder(DEFAULT_SETTINGS.pullAppendTag).setValue(this.plugin.settings.pullAppendTag).onChange(async (value) => {
+        this.plugin.settings.pullAppendTag = value.trim() || DEFAULT_SETTINGS.pullAppendTag;
+        await this.plugin.saveDataModel();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(this.t("sync_now")).setDesc(this.t("sync_now_desc")).addButton((btn) => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow()));
+    new import_obsidian.Setting(containerEl).setName(this.t("auto_sync")).setDesc(this.t("auto_sync_desc")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async (value) => {
         this.plugin.settings.autoSyncEnabled = value;
         await this.plugin.saveDataModel();
         this.plugin.configureAutoSync();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Auto sync interval (minutes)").setDesc("Minimum 1 minute").addText(
+    new import_obsidian.Setting(containerEl).setName(this.t("auto_sync_interval")).setDesc(this.t("auto_sync_interval_desc")).addText(
       (text) => text.setValue(String(this.plugin.settings.autoSyncIntervalMinutes)).onChange(async (value) => {
         const num = Number.parseInt(value, 10);
         this.plugin.settings.autoSyncIntervalMinutes = Number.isFinite(num) ? Math.max(1, num) : 5;
@@ -1578,19 +1864,19 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         this.plugin.configureAutoSync();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Deletion policy").setDesc("Action when a synced task is deleted from note").addDropdown((dropdown) => {
-      dropdown.addOption("complete", "Mark as completed (recommended)").addOption("delete", "Delete task in Microsoft To Do").addOption("detach", "Detach only (keep remote task)").setValue(this.plugin.settings.deletionPolicy || "complete").onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName(this.t("deletion_policy")).setDesc(this.t("deletion_policy_desc")).addDropdown((dropdown) => {
+      dropdown.addOption("complete", this.t("deletion_complete")).addOption("delete", this.t("deletion_delete")).addOption("detach", this.t("deletion_detach")).setValue(this.plugin.settings.deletionPolicy || "complete").onChange(async (value) => {
         const normalized = value === "delete" || value === "detach" ? value : "complete";
         this.plugin.settings.deletionPolicy = normalized;
         await this.plugin.saveDataModel();
       });
     });
-    new import_obsidian.Setting(containerEl).setName("Current file list binding").setDesc("Select list for active file").addButton(
-      (btn) => btn.setButtonText("Select list").onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName(this.t("current_file_binding")).setDesc(this.t("current_file_binding_desc")).addButton(
+      (btn) => btn.setButtonText(this.t("select_list")).onClick(async () => {
         await this.plugin.selectListForCurrentFile();
       })
     ).addButton(
-      (btn) => btn.setButtonText("Clear sync state").onClick(async () => {
+      (btn) => btn.setButtonText(this.t("clear_sync_state")).onClick(async () => {
         await this.plugin.clearSyncStateForCurrentFile();
       })
     );

@@ -57,6 +57,7 @@ type GraphChecklistItem = {
 };
 
 type DeletionPolicy = "complete" | "delete" | "detach";
+type PullInsertLocation = "cursor" | "top" | "bottom" | "existing_group";
 
 interface MicrosoftToDoSettings {
   clientId: string;
@@ -68,6 +69,12 @@ interface MicrosoftToDoSettings {
   autoSyncEnabled: boolean;
   autoSyncIntervalMinutes: number;
   deletionPolicy: DeletionPolicy;
+  pullGroupUnderHeading: boolean;
+  pullHeadingText: string;
+  pullHeadingLevel: number;
+  pullInsertLocation: PullInsertLocation;
+  pullAppendTagEnabled: boolean;
+  pullAppendTag: string;
 }
 
 interface FileSyncConfig {
@@ -111,7 +118,13 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
-  deletionPolicy: "complete"
+  deletionPolicy: "complete",
+  pullGroupUnderHeading: false,
+  pullHeadingText: "Microsoft To Do",
+  pullHeadingLevel: 2,
+  pullInsertLocation: "bottom",
+  pullAppendTagEnabled: false,
+  pullAppendTag: "MicrosoftTodo"
 };
 
 const BLOCK_ID_PREFIX = "mtd_";
@@ -125,6 +138,7 @@ type ParsedTaskLine = {
   title: string;
   dueDate?: string;
   blockId: string;
+  mtdTag?: string;
 };
 
 class GraphClient {
@@ -637,9 +651,9 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    const hadTrailingBlank = lines.length > 0 && lines[lines.length - 1].trim().length === 0;
-    if (!hadTrailingBlank) lines.push("");
-    lines.push("");
+    const insertAt = this.resolvePullInsertIndex(lines, file);
+    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
+    const insertLines: string[] = [];
 
     const fileMtime = file.stat.mtime;
     let added = 0;
@@ -650,8 +664,8 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (!title) continue;
       const completed = graphStatusToCompleted(task.status);
       const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${blockId} -->`;
-      lines.push(line);
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, tagForPull)} <!-- mtd:${blockId} -->`;
+      insertLines.push(line);
 
       const mappingKey = buildMappingKey(file.path, blockId);
       const localHash = hashTask(title, completed, dueDate);
@@ -675,8 +689,8 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           const displayName = sanitizeTitleForGraph((item.displayName || "").trim());
           if (!displayName) continue;
           const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-          const childLine = `  - [${item.isChecked ? "x" : " "}] ${displayName} <!-- mtd:${childBlockId} -->`;
-          lines.push(childLine);
+          const childLine = `  - [${item.isChecked ? "x" : " "}] ${buildMarkdownTaskText(displayName, undefined, tagForPull)} <!-- mtd:${childBlockId} -->`;
+          insertLines.push(childLine);
           const childKey = buildMappingKey(file.path, childBlockId);
           const childLocalHash = hashChecklist(displayName, item.isChecked);
           const childGraphHash = hashChecklist(displayName, item.isChecked);
@@ -699,6 +713,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     }
 
     if (added > 0) {
+      lines.splice(insertAt, 0, ...insertLines);
       await this.app.vault.modify(file, lines.join("\n"));
       await this.saveDataModel();
       if (syncAfter) {
@@ -712,8 +727,9 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     await this.getValidAccessToken();
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
+    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
 
-    let tasks = parseMarkdownTasks(lines);
+    let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     if (tasks.length === 0) return 0;
 
     let changed = false;
@@ -808,7 +824,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         if (!name) continue;
         if (localChildTitles.has(name)) continue;
         const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-        toInsert.push(`  - [ ] ${name} <!-- mtd:${childBlockId} -->`);
+        toInsert.push(`  - [ ] ${buildMarkdownTaskText(name, undefined, tagForPull)} <!-- mtd:${childBlockId} -->`);
         const ck = buildMappingKey(file.path, childBlockId);
         this.dataModel.checklistMappings[ck] = {
           listId: parentEntry.listId,
@@ -862,7 +878,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
 
-    let tasks = parseMarkdownTasks(lines);
+    let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     const mappingPrefix = `${file.path}::`;
     if (tasks.length === 0) {
       const removedMappings = Object.keys(this.dataModel.taskMappings).filter(key => key.startsWith(mappingPrefix));
@@ -1062,7 +1078,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         }
 
         if (!localChanged && graphChanged) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${remote.displayName} ^${task.blockId}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -1082,7 +1098,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         const graphTime = remote.lastModifiedDateTime ? Date.parse(remote.lastModifiedDateTime) : 0;
         const localTime = fileMtime;
         if (graphTime > localTime) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${remote.displayName} ^${task.blockId}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -1308,6 +1324,160 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     return activeView?.file ?? null;
   }
 
+  private getCursorLineForFile(file: TFile): number | null {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view || !view.file || view.file.path !== file.path) return null;
+    return view.editor.getCursor().line;
+  }
+
+  private getPullTagNamesToPreserve(): string[] {
+    const tags = [this.settings.pullAppendTag, DEFAULT_SETTINGS.pullAppendTag]
+      .map(t => (t || "").trim())
+      .filter(Boolean)
+      .map(t => (t.startsWith("#") ? t.slice(1) : t));
+    return Array.from(new Set(tags));
+  }
+
+  private findFrontMatterEnd(lines: string[]): number {
+    if ((lines[0] || "").trim() !== "---") return 0;
+    for (let i = 1; i < lines.length; i++) {
+      if ((lines[i] || "").trim() === "---") return i + 1;
+    }
+    return 0;
+  }
+
+  private findPullHeadingLine(lines: string[], headingText: string, headingLevel: number): number {
+    const text = headingText.trim();
+    if (!text) return -1;
+    const hashes = "#".repeat(Math.min(6, Math.max(1, Math.floor(headingLevel || 2))));
+    const pattern = new RegExp(`^${escapeRegExp(hashes)}\\s+${escapeRegExp(text)}\\s*$`);
+    const candidateLines: number[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (pattern.test(lines[i] || "")) candidateLines.push(i);
+    }
+    if (candidateLines.length === 0) return -1;
+    if (candidateLines.length === 1) return candidateLines[0];
+
+    const markerPattern = /<!--\s*mtd\s*:/i;
+    const sectionEndOf = (headingLine: number): number => {
+      const nextHeading = /^(#{1,6})\s+/;
+      for (let i = headingLine + 1; i < lines.length; i++) {
+        const m = nextHeading.exec(lines[i] || "");
+        if (!m) continue;
+        const level = m[1].length;
+        if (level <= headingLevel) return i;
+      }
+      return lines.length;
+    };
+
+    let bestLine = candidateLines[0];
+    let bestScore = -1;
+    for (const headingLine of candidateLines) {
+      const end = sectionEndOf(headingLine);
+      let score = 0;
+      for (let i = headingLine + 1; i < end; i++) {
+        if (markerPattern.test(lines[i] || "")) score++;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestLine = headingLine;
+      }
+    }
+
+    return bestScore > 0 ? bestLine : candidateLines[0];
+  }
+
+  private resolveBaseInsertIndex(lines: string[], file: TFile, location: PullInsertLocation): number {
+    if (location === "cursor") {
+      const cursorLine = this.getCursorLineForFile(file);
+      if (cursorLine !== null) return Math.min(lines.length, Math.max(0, cursorLine));
+      return lines.length;
+    }
+    if (location === "top") {
+      return this.findFrontMatterEnd(lines);
+    }
+    return lines.length;
+  }
+
+  private resolvePullInsertIndex(lines: string[], file: TFile): number {
+    const location = this.settings.pullInsertLocation || "bottom";
+
+    if (!this.settings.pullGroupUnderHeading) {
+      const normalizedLocation: PullInsertLocation = location === "existing_group" ? "bottom" : location;
+      const index = this.resolveBaseInsertIndex(lines, file, normalizedLocation);
+      if (normalizedLocation === "bottom") {
+        const last = lines.length > 0 ? lines[lines.length - 1] : "";
+        if (index === lines.length && last.trim().length > 0) {
+          lines.push("");
+          return lines.length;
+        }
+      }
+      if (normalizedLocation === "top") {
+        if (index < lines.length && (lines[index] || "").trim().length > 0) {
+          lines.splice(index, 0, "");
+          return index + 1;
+        }
+      }
+      return index;
+    }
+
+    const headingText = (this.settings.pullHeadingText || DEFAULT_SETTINGS.pullHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
+    const headingLevel = Math.min(6, Math.max(1, Math.floor(this.settings.pullHeadingLevel || DEFAULT_SETTINGS.pullHeadingLevel)));
+
+    let headingLine = this.findPullHeadingLine(lines, headingText, headingLevel);
+    if (headingLine < 0) {
+      const creationLocation: PullInsertLocation = location === "existing_group" ? "bottom" : location;
+      let insertAt = this.resolveBaseInsertIndex(lines, file, creationLocation);
+      if (insertAt > 0 && (lines[insertAt - 1] || "").trim().length > 0) {
+        lines.splice(insertAt, 0, "");
+        insertAt++;
+      }
+      const heading = `${"#".repeat(headingLevel)} ${headingText}`;
+      lines.splice(insertAt, 0, heading);
+      headingLine = insertAt;
+      if (headingLine + 1 >= lines.length || (lines[headingLine + 1] || "").trim().length > 0) {
+        lines.splice(headingLine + 1, 0, "");
+      }
+    } else {
+      if (headingLine + 1 >= lines.length || (lines[headingLine + 1] || "").trim().length > 0) {
+        lines.splice(headingLine + 1, 0, "");
+      }
+    }
+
+    const sectionStart = headingLine + 1;
+    let sectionEnd = lines.length;
+    const nextHeading = /^(#{1,6})\s+/;
+    for (let i = headingLine + 1; i < lines.length; i++) {
+      const m = nextHeading.exec(lines[i] || "");
+      if (!m) continue;
+      const level = m[1].length;
+      if (level <= headingLevel) {
+        sectionEnd = i;
+        break;
+      }
+    }
+
+    if (location === "existing_group") {
+      return sectionEnd;
+    }
+
+    if (location === "top") {
+      let i = sectionStart;
+      while (i < sectionEnd && (lines[i] || "").trim().length === 0) i++;
+      return i;
+    }
+
+    if (location === "cursor") {
+      const cursorLine = this.getCursorLineForFile(file);
+      if (cursorLine !== null && cursorLine >= sectionStart && cursorLine <= sectionEnd) {
+        return cursorLine;
+      }
+      return sectionEnd;
+    }
+
+    return sectionEnd;
+  }
+
   private async openListPicker(lists: GraphTodoList[], selectedId: string): Promise<string | null> {
     return await new Promise(resolve => {
       const modal = new ListSelectModal(this.app, lists, selectedId, resolve);
@@ -1340,6 +1510,19 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
           ? "delete"
           : "complete";
 
+    const pullInsertLocationRaw = settingsRaw.pullInsertLocation;
+    const pullInsertLocation: PullInsertLocation =
+      pullInsertLocationRaw === "cursor" ||
+      pullInsertLocationRaw === "top" ||
+      pullInsertLocationRaw === "bottom" ||
+      pullInsertLocationRaw === "existing_group"
+        ? pullInsertLocationRaw
+        : DEFAULT_SETTINGS.pullInsertLocation;
+
+    const headingLevelRaw = settingsRaw.pullHeadingLevel;
+    const pullHeadingLevel =
+      typeof headingLevelRaw === "number" && Number.isFinite(headingLevelRaw) ? Math.min(6, Math.max(1, Math.floor(headingLevelRaw))) : 2;
+
     const migratedSettings: MicrosoftToDoSettings = {
       ...DEFAULT_SETTINGS,
       clientId: typeof settingsRaw.clientId === "string" ? settingsRaw.clientId : DEFAULT_SETTINGS.clientId,
@@ -1354,7 +1537,15 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
         typeof settingsRaw.autoSyncIntervalMinutes === "number"
           ? settingsRaw.autoSyncIntervalMinutes
           : DEFAULT_SETTINGS.autoSyncIntervalMinutes,
-      deletionPolicy
+      deletionPolicy,
+      pullGroupUnderHeading:
+        typeof settingsRaw.pullGroupUnderHeading === "boolean" ? settingsRaw.pullGroupUnderHeading : DEFAULT_SETTINGS.pullGroupUnderHeading,
+      pullHeadingText: typeof settingsRaw.pullHeadingText === "string" ? settingsRaw.pullHeadingText : DEFAULT_SETTINGS.pullHeadingText,
+      pullHeadingLevel,
+      pullInsertLocation,
+      pullAppendTagEnabled:
+        typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
+      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag
     };
 
     return {
@@ -1390,11 +1581,27 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
   };
 }
 
-function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseMarkdownTasks(lines: string[], tagNamesToPreserve: string[] = []): ParsedTaskLine[] {
   const tasks: ParsedTaskLine[] = [];
   const taskPattern = /^(\s*)([-*])\s+\[([ xX])\]\s+(.*)$/;
   const blockIdCaretPattern = /\s+\^([a-z0-9_]+)\s*$/i;
   const blockIdCommentPattern = /\s*<!--\s*mtd\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
+  const normalizedTags = Array.from(
+    new Set(
+      tagNamesToPreserve
+        .map(t => (t || "").trim())
+        .filter(Boolean)
+        .map(t => (t.startsWith("#") ? t.slice(1) : t))
+    )
+  );
+  const tagRegex =
+    normalizedTags.length > 0
+      ? new RegExp(String.raw`(?:^|\s)#(${normalizedTags.map(escapeRegExp).join("|")})(?=\s*$)`)
+      : null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = taskPattern.exec(line);
@@ -1409,8 +1616,13 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
     const caretMatch = commentMatch ? null : blockIdCaretPattern.exec(rest);
     const markerMatch = commentMatch || caretMatch;
     const existingBlockId = markerMatch ? markerMatch[1] : "";
-    const rawTitle = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
-    if (!rawTitle) continue;
+    const rawTitleWithTag = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
+    if (!rawTitleWithTag) continue;
+
+    const tagMatch = tagRegex ? tagRegex.exec(rawTitleWithTag) : null;
+    const mtdTag = tagMatch ? `#${tagMatch[1]}` : undefined;
+    const rawTitle = tagMatch ? rawTitleWithTag.slice(0, tagMatch.index).trim() : rawTitleWithTag;
+
     const { title, dueDate } = extractDueFromMarkdownTitle(rawTitle);
     if (!title) continue;
 
@@ -1425,7 +1637,8 @@ function parseMarkdownTasks(lines: string[]): ParsedTaskLine[] {
       completed,
       title,
       dueDate,
-      blockId
+      blockId,
+      mtdTag
     });
   }
   return tasks;
@@ -1448,7 +1661,7 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
 
     const prefix = isNested ? CHECKLIST_BLOCK_ID_PREFIX : BLOCK_ID_PREFIX;
     const newBlockId = `${prefix}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskTitle(task.title, task.dueDate)} <!-- mtd:${newBlockId} -->`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} <!-- mtd:${newBlockId} -->`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
@@ -1458,7 +1671,7 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
 }
 
 function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean, dueDate?: string): string {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskTitle(title, dueDate)} <!-- mtd:${task.blockId} -->`;
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, task.mtdTag)} <!-- mtd:${task.blockId} -->`;
 }
 
 function randomId(length: number): string {
@@ -1513,11 +1726,14 @@ function sanitizeTitleForGraph(title: string): string {
   return withoutIds;
 }
 
-function buildMarkdownTaskTitle(title: string, dueDate?: string): string {
-  const trimmed = (title || "").trim();
-  if (!trimmed) return trimmed;
-  if (!dueDate) return trimmed;
-  return `${trimmed} 📅 ${dueDate}`;
+function buildMarkdownTaskText(title: string, dueDate?: string, tag?: string): string {
+  const trimmedTitle = (title || "").trim();
+  if (!trimmedTitle) return trimmedTitle;
+  const base = dueDate ? `${trimmedTitle} 📅 ${dueDate}` : trimmedTitle;
+  const normalizedTag = (tag || "").trim();
+  if (!normalizedTag) return base;
+  const token = normalizedTag.startsWith("#") ? normalizedTag : `#${normalizedTag}`;
+  return `${base} ${token}`;
 }
 
 function extractDueFromMarkdownTitle(rawTitle: string): { title: string; dueDate?: string } {
@@ -1732,21 +1948,86 @@ async function requestUrlNoThrow(params: RequestUrlParam): Promise<{
 
 class MicrosoftToDoSettingTab extends PluginSettingTab {
   plugin: MicrosoftToDoLinkPlugin;
+  private t: (key: string) => string;
 
   constructor(app: App, plugin: MicrosoftToDoLinkPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+    const lang = (navigator.language || "en").toLowerCase();
+    const isZh = lang.startsWith("zh");
+    const dict: Record<string, string> = {
+      heading_main: isZh ? "Microsoft To Do 链接" : "Microsoft To Do Link",
+      azure_client_id: isZh ? "Azure 客户端 ID" : "Azure client ID",
+      azure_client_desc: isZh ? "在 Azure Portal 注册的公共客户端 ID" : "Public client ID registered in Azure Portal",
+      tenant_id: isZh ? "租户 ID" : "Tenant ID",
+      tenant_id_desc: isZh ? "租户 ID（个人账户使用 common）" : "Tenant ID (use 'common' for personal accounts)",
+      account_status: isZh ? "账号状态" : "Account status",
+      logged_in: isZh ? "已登录" : "Logged in",
+      authorized_refresh: isZh ? "已授权（自动刷新）" : "Authorized (auto-refresh)",
+      not_logged_in: isZh ? "未登录" : "Not logged in",
+      device_code: isZh ? "设备登录代码" : "Device login code",
+      device_code_desc: isZh ? "复制代码并在登录页面中输入" : "Copy code to login page",
+      copy_code: isZh ? "复制代码" : "Copy code",
+      open_login_page: isZh ? "打开登录页面" : "Open login page",
+      cannot_open_browser: isZh ? "无法打开浏览器" : "Cannot open browser",
+      copied: isZh ? "已复制" : "Copied",
+      copy_failed: isZh ? "复制失败" : "Copy failed",
+      login_logout: isZh ? "登录 / 登出" : "Login / logout",
+      login_logout_desc: isZh ? "登录将打开浏览器；登出会清除本地令牌" : "Login opens browser; logout clears local token",
+      login: isZh ? "登录" : "Login",
+      logout: isZh ? "登出" : "Logout",
+      logged_out: isZh ? "已登出" : "Logged out",
+      login_failed: isZh ? "登录失败，请查看控制台" : "Login failed, check console",
+      default_list: isZh ? "默认 Microsoft To Do 列表" : "Default Microsoft To Do list",
+      default_list_desc: isZh ? "当未配置特定列表时使用该列表" : "Used when no specific list is configured",
+      select_list: isZh ? "选择列表" : "Select list",
+      load_list_failed: isZh ? "加载列表失败，请查看控制台" : "Failed to load lists, check console",
+      list_id_placeholder: isZh ? "列表 ID（可选）" : "List ID (optional)",
+      pull_options_heading: isZh ? "拉取选项" : "Pull options",
+      pull_insert: isZh ? "拉取任务插入位置" : "Pulled task insertion",
+      pull_insert_desc: isZh ? "从 Microsoft To Do 拉取的新任务插入位置" : "Where to insert new tasks pulled from Microsoft To Do",
+      at_cursor: isZh ? "光标处" : "At cursor",
+      top_of_file: isZh ? "文档最上" : "Top of file",
+      bottom_of_file: isZh ? "文档最下" : "Bottom of file",
+      existing_group: isZh ? "原先分组处" : "Existing group section",
+      group_heading: isZh ? "在标题下分组存放" : "Group pulled tasks under heading",
+      group_heading_desc: isZh ? "把拉取的任务集中插入到指定标题区" : "Insert pulled tasks into a dedicated section",
+      pull_heading_text: isZh ? "分组标题文本" : "Pull section heading",
+      pull_heading_text_desc: isZh ? "启用分组时使用的标题文本" : "Heading text used when grouping is enabled",
+      pull_heading_level: isZh ? "分组标题级别" : "Pull section heading level",
+      pull_heading_level_desc: isZh ? "启用分组时使用的标题级别" : "Heading level used when grouping is enabled",
+      append_tag: isZh ? "拉取时追加标签" : "Append tag on pull",
+      append_tag_desc: isZh ? "为从 Microsoft To Do 拉取的任务追加标签" : "Append a tag to tasks pulled from Microsoft To Do",
+      pull_tag_name: isZh ? "拉取标签名称" : "Pull tag name",
+      pull_tag_name_desc: isZh ? "不含 # 的标签名，追加到拉取任务末尾" : "Tag without '#', appended to pulled tasks",
+      sync_now: isZh ? "立即同步" : "Sync now",
+      sync_now_desc: isZh ? "完整同步（优先拉取未完成任务）" : "Full sync (pulls incomplete tasks first)",
+      sync_current_file: isZh ? "同步当前文件" : "Sync current file",
+      auto_sync: isZh ? "自动同步" : "Auto sync",
+      auto_sync_desc: isZh ? "周期性同步已绑定文件" : "Sync mapped files periodically",
+      auto_sync_interval: isZh ? "自动同步间隔（分钟）" : "Auto sync interval (minutes)",
+      auto_sync_interval_desc: isZh ? "至少 1 分钟" : "Minimum 1 minute",
+      deletion_policy: isZh ? "删除策略" : "Deletion policy",
+      deletion_policy_desc: isZh ? "删除笔记中已同步任务时的云端动作" : "Action when a synced task is deleted from note",
+      deletion_complete: isZh ? "标记完成（推荐）" : "Mark as completed (recommended)",
+      deletion_delete: isZh ? "删除（Microsoft To Do）" : "Delete task in Microsoft To Do",
+      deletion_detach: isZh ? "仅解除绑定（保留云端任务）" : "Detach only (keep remote task)",
+      current_file_binding: isZh ? "当前文件列表绑定" : "Current file list binding",
+      current_file_binding_desc: isZh ? "为当前活动文件选择列表" : "Select list for active file",
+      clear_sync_state: isZh ? "清除同步状态" : "Clear sync state"
+    };
+    this.t = (key: string) => dict[key] ?? key;
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     
-    new Setting(containerEl).setName("Microsoft To Do Link").setHeading();
+    new Setting(containerEl).setName(this.t("heading_main")).setHeading();
 
     new Setting(containerEl)
-      .setName("Azure client ID")
-      .setDesc("Public client ID registered in Azure Portal")
+      .setName(this.t("azure_client_id"))
+      .setDesc(this.t("azure_client_desc"))
       .addText(text =>
         text
           .setPlaceholder("00000000-0000-0000-0000-000000000000")
@@ -1758,8 +2039,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Tenant ID")
-      .setDesc("Tenant ID (use 'common' for personal accounts)")
+      .setName(this.t("tenant_id"))
+      .setDesc(this.t("tenant_id_desc"))
       .addText(text =>
         text
           .setPlaceholder("common")
@@ -1770,61 +2051,61 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           })
       );
 
-    const loginSetting = new Setting(containerEl).setName("Account status");
+    const loginSetting = new Setting(containerEl).setName(this.t("account_status"));
     const statusEl = loginSetting.descEl.createDiv();
     statusEl.setCssProps({ marginTop: "6px" });
     const now = Date.now();
     const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 60_000;
     const canRefresh = Boolean(this.plugin.settings.refreshToken);
     if (tokenValid) {
-      statusEl.setText("Logged in");
+      statusEl.setText(this.t("logged_in"));
     } else if (canRefresh) {
-      statusEl.setText("Authorized (auto-refresh)");
+      statusEl.setText(this.t("authorized_refresh"));
     } else {
-      statusEl.setText("Not logged in");
+      statusEl.setText(this.t("not_logged_in"));
     }
 
     const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
     if (pending) {
       new Setting(containerEl)
-        .setName("Device login code")
-        .setDesc("Copy code to login page")
+        .setName(this.t("device_code"))
+        .setDesc(this.t("device_code_desc"))
         .addText(text => {
           text.setValue(pending.userCode);
           text.inputEl.readOnly = true;
         })
         .addButton(btn =>
-          btn.setButtonText("Copy code").onClick(async () => {
+          btn.setButtonText(this.t("copy_code")).onClick(async () => {
             try {
               await navigator.clipboard.writeText(pending.userCode);
-              new Notice("Copied");
+              new Notice(this.t("copied"));
             } catch (error) {
               console.error(error);
-              new Notice("Copy failed");
+              new Notice(this.t("copy_failed"));
             }
           })
         )
         .addButton(btn =>
-          btn.setButtonText("Open login page").onClick(() => {
+          btn.setButtonText(this.t("open_login_page")).onClick(() => {
             try {
               window.open(pending.verificationUri, "_blank");
             } catch (error) {
               console.error(error);
-              new Notice("Cannot open browser");
+              new Notice(this.t("cannot_open_browser"));
             }
           })
         );
     }
 
     new Setting(containerEl)
-      .setName("Login / logout")
-      .setDesc("Login opens browser; logout clears local token")
+      .setName(this.t("login_logout"))
+      .setDesc(this.t("login_logout_desc"))
       .addButton(btn =>
-        btn.setButtonText(this.plugin.isLoggedIn() ? "Logout" : "Login").onClick(async () => {
+        btn.setButtonText(this.plugin.isLoggedIn() ? this.t("logout") : this.t("login")).onClick(async () => {
           try {
             if (this.plugin.isLoggedIn()) {
               await this.plugin.logout();
-              new Notice("Logged out");
+              new Notice(this.t("logged_out"));
               this.display();
               return;
             }
@@ -1832,30 +2113,30 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           } catch (error) {
             const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice(message || "Login failed, check console");
+            new Notice(message || this.t("login_failed"));
             this.display();
           }
         })
       );
 
     new Setting(containerEl)
-      .setName("Default Microsoft To Do list")
-      .setDesc("Used when no specific list is configured")
+      .setName(this.t("default_list"))
+      .setDesc(this.t("default_list_desc"))
       .addButton(btn =>
-        btn.setButtonText("Select list").onClick(async () => {
+        btn.setButtonText(this.t("select_list")).onClick(async () => {
           try {
             await this.plugin.selectDefaultListWithUi();
             this.display();
           } catch (error) {
             const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice(message || "Failed to load lists, check console");
+            new Notice(message || this.t("load_list_failed"));
           }
         })
       )
       .addText(text =>
         text
-          .setPlaceholder("List ID (optional)")
+          .setPlaceholder(this.t("list_id_placeholder"))
           .setValue(this.plugin.settings.defaultListId)
           .onChange(async value => {
             this.plugin.settings.defaultListId = value.trim();
@@ -1863,14 +2144,105 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
-      .setName("Sync now")
-      .setDesc("Full sync (pulls incomplete tasks first)")
-      .addButton(btn => btn.setButtonText("Sync current file").onClick(async () => await this.plugin.syncCurrentFileNow()));
+    new Setting(containerEl).setName(this.t("pull_options_heading")).setHeading();
 
     new Setting(containerEl)
-      .setName("Auto sync")
-      .setDesc("Sync mapped files periodically")
+      .setName(this.t("pull_insert"))
+      .setDesc(this.t("pull_insert_desc"))
+      .addDropdown(dropdown => {
+        dropdown
+          .addOption("cursor", this.t("at_cursor"))
+          .addOption("top", this.t("top_of_file"))
+          .addOption("bottom", this.t("bottom_of_file"))
+          .addOption("existing_group", this.t("existing_group"))
+          .setValue(this.plugin.settings.pullInsertLocation)
+          .onChange(async value => {
+            const normalized =
+              value === "cursor" || value === "top" || value === "existing_group" ? (value as PullInsertLocation) : "bottom";
+            this.plugin.settings.pullInsertLocation = normalized;
+            await this.plugin.saveDataModel();
+          });
+
+        const option = Array.from(dropdown.selectEl.options).find(o => o.value === "existing_group");
+        if (option) option.disabled = !this.plugin.settings.pullGroupUnderHeading;
+        if (!this.plugin.settings.pullGroupUnderHeading && this.plugin.settings.pullInsertLocation === "existing_group") {
+          this.plugin.settings.pullInsertLocation = "bottom";
+          void this.plugin.saveDataModel();
+          dropdown.setValue("bottom");
+        }
+      });
+
+    new Setting(containerEl)
+      .setName(this.t("group_heading"))
+      .setDesc(this.t("group_heading_desc"))
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.pullGroupUnderHeading).onChange(async value => {
+          this.plugin.settings.pullGroupUnderHeading = value;
+          if (!value && this.plugin.settings.pullInsertLocation === "existing_group") {
+            this.plugin.settings.pullInsertLocation = "bottom";
+          }
+          await this.plugin.saveDataModel();
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(this.t("pull_heading_text"))
+      .setDesc(this.t("pull_heading_text_desc"))
+      .addText(text =>
+        text.setValue(this.plugin.settings.pullHeadingText).onChange(async value => {
+          this.plugin.settings.pullHeadingText = value.trim() || DEFAULT_SETTINGS.pullHeadingText;
+          await this.plugin.saveDataModel();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(this.t("pull_heading_level"))
+      .setDesc(this.t("pull_heading_level_desc"))
+      .addDropdown(dropdown => {
+        dropdown
+          .addOption("1", "H1")
+          .addOption("2", "H2")
+          .addOption("3", "H3")
+          .addOption("4", "H4")
+          .addOption("5", "H5")
+          .addOption("6", "H6")
+          .setValue(String(this.plugin.settings.pullHeadingLevel || DEFAULT_SETTINGS.pullHeadingLevel))
+          .onChange(async value => {
+            const num = Number.parseInt(value, 10);
+            this.plugin.settings.pullHeadingLevel = Number.isFinite(num) ? Math.min(6, Math.max(1, num)) : DEFAULT_SETTINGS.pullHeadingLevel;
+            await this.plugin.saveDataModel();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName(this.t("append_tag"))
+      .setDesc(this.t("append_tag_desc"))
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.pullAppendTagEnabled).onChange(async value => {
+          this.plugin.settings.pullAppendTagEnabled = value;
+          await this.plugin.saveDataModel();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(this.t("pull_tag_name"))
+      .setDesc(this.t("pull_tag_name_desc"))
+      .addText(text =>
+        text.setPlaceholder(DEFAULT_SETTINGS.pullAppendTag).setValue(this.plugin.settings.pullAppendTag).onChange(async value => {
+          this.plugin.settings.pullAppendTag = value.trim() || DEFAULT_SETTINGS.pullAppendTag;
+          await this.plugin.saveDataModel();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(this.t("sync_now"))
+      .setDesc(this.t("sync_now_desc"))
+      .addButton(btn => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow()));
+
+    new Setting(containerEl)
+      .setName(this.t("auto_sync"))
+      .setDesc(this.t("auto_sync_desc"))
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async value => {
           this.plugin.settings.autoSyncEnabled = value;
@@ -1880,8 +2252,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Auto sync interval (minutes)")
-      .setDesc("Minimum 1 minute")
+      .setName(this.t("auto_sync_interval"))
+      .setDesc(this.t("auto_sync_interval_desc"))
       .addText(text =>
         text.setValue(String(this.plugin.settings.autoSyncIntervalMinutes)).onChange(async value => {
           const num = Number.parseInt(value, 10);
@@ -1892,13 +2264,13 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Deletion policy")
-      .setDesc("Action when a synced task is deleted from note")
+      .setName(this.t("deletion_policy"))
+      .setDesc(this.t("deletion_policy_desc"))
       .addDropdown(dropdown => {
         dropdown
-          .addOption("complete", "Mark as completed (recommended)")
-          .addOption("delete", "Delete task in Microsoft To Do")
-          .addOption("detach", "Detach only (keep remote task)")
+          .addOption("complete", this.t("deletion_complete"))
+          .addOption("delete", this.t("deletion_delete"))
+          .addOption("detach", this.t("deletion_detach"))
           .setValue(this.plugin.settings.deletionPolicy || "complete")
           .onChange(async value => {
             const normalized = value === "delete" || value === "detach" ? value : "complete";
@@ -1908,15 +2280,15 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Current file list binding")
-      .setDesc("Select list for active file")
+      .setName(this.t("current_file_binding"))
+      .setDesc(this.t("current_file_binding_desc"))
       .addButton(btn =>
-        btn.setButtonText("Select list").onClick(async () => {
+        btn.setButtonText(this.t("select_list")).onClick(async () => {
           await this.plugin.selectListForCurrentFile();
         })
       )
       .addButton(btn =>
-        btn.setButtonText("Clear sync state").onClick(async () => {
+        btn.setButtonText(this.t("clear_sync_state")).onClick(async () => {
           await this.plugin.clearSyncStateForCurrentFile();
         })
       );
