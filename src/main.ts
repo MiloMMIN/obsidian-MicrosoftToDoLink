@@ -75,10 +75,12 @@ interface MicrosoftToDoSettings {
   pullInsertLocation: PullInsertLocation;
   pullAppendTagEnabled: boolean;
   pullAppendTag: string;
+  // Feature flag for auto-populating frontmatter
+  autoPopulateFrontmatter: boolean;
 }
 
 interface FileSyncConfig {
-  listId?: string;
+  listIds?: string[];
 }
 
 interface TaskMappingEntry {
@@ -124,7 +126,8 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   pullHeadingLevel: 2,
   pullInsertLocation: "bottom",
   pullAppendTagEnabled: false,
-  pullAppendTag: "MicrosoftTodo"
+  pullAppendTag: "MicrosoftTodo",
+  autoPopulateFrontmatter: false
 };
 
 const BLOCK_ID_PREFIX = "mtd_";
@@ -319,20 +322,174 @@ class ListSelectModal extends Modal {
   }
 }
 
+class ListMultiSelectModal extends Modal {
+  private lists: GraphTodoList[];
+  private selectedIds: Set<string>;
+  private resolve: (value: string[] | null) => void;
+
+  constructor(app: App, lists: GraphTodoList[], selectedIds: string[], resolve: (value: string[] | null) => void) {
+    super(app);
+    this.lists = lists;
+    this.selectedIds = new Set(selectedIds);
+    this.resolve = resolve;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    new Setting(contentEl).setName("Select Microsoft To Do lists").setHeading();
+    contentEl.createDiv({ text: "Select one or more lists to bind:", cls: "setting-item-description" });
+
+    const listContainer = contentEl.createDiv();
+    listContainer.style.maxHeight = "300px";
+    listContainer.style.overflowY = "auto";
+    listContainer.style.marginTop = "10px";
+    listContainer.style.border = "1px solid var(--background-modifier-border)";
+    listContainer.style.padding = "10px";
+    listContainer.style.borderRadius = "4px";
+
+    for (const list of this.lists) {
+      const row = listContainer.createDiv();
+      row.style.display = "flex";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "5px";
+
+      const checkbox = row.createEl("input", { type: "checkbox" });
+      checkbox.checked = this.selectedIds.has(list.id);
+      checkbox.onchange = (e) => {
+        if ((e.target as HTMLInputElement).checked) {
+          this.selectedIds.add(list.id);
+        } else {
+          this.selectedIds.delete(list.id);
+        }
+      };
+
+      const label = row.createEl("label", { text: list.displayName });
+      label.style.marginLeft = "8px";
+      label.onclick = () => {
+        checkbox.checked = !checkbox.checked;
+        checkbox.onchange?.({ target: checkbox } as any);
+      };
+    }
+
+    const buttonRow = contentEl.createDiv({ cls: "mtd-button-row" });
+    buttonRow.setCssProps({ marginTop: "15px" });
+    buttonRow.style.display = "flex";
+    buttonRow.style.justifyContent = "flex-end";
+    buttonRow.style.gap = "10px";
+
+    const cancelBtn = buttonRow.createEl("button", { text: "Cancel" });
+    const okBtn = buttonRow.createEl("button", { text: "Save", cls: "mod-cta" });
+
+    cancelBtn.onclick = () => {
+      this.resolve(null);
+      this.close();
+    };
+
+    okBtn.onclick = () => {
+      this.resolve(Array.from(this.selectedIds));
+      this.close();
+    };
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class MicrosoftToDoLinkPlugin extends Plugin {
   dataModel!: PluginDataModel;
   graph!: GraphClient;
-  private todoListsCache: GraphTodoList[] = [];
+  todoListsCache: GraphTodoList[] = [];
   private autoSyncTimerId: number | null = null;
   private loginInProgress = false;
   pendingDeviceCode: { userCode: string; verificationUri: string; expiresAt: number } | null = null;
+  statusBarItem: HTMLElement | null = null;
 
   async onload() {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
 
-    this.addRibbonIcon("refresh-cw", "Microsoft To Do Sync: current file", async () => {
-      await this.syncCurrentFileNow();
+    // Register frontmatter property if available (private API)
+    // @ts-ignore
+    if (this.app.metadataTypeManager) {
+      // @ts-ignore
+      this.app.metadataTypeManager.setType("microsoft-todo-list", "multitext");
+      // @ts-ignore
+      this.app.metadataTypeManager.setType("mtd-list", "multitext");
+    }
+
+    this.statusBarItem = this.addStatusBarItem();
+    this.updateStatusBar("idle");
+
+    this.registerEvent(
+      this.app.metadataCache.on("changed", async (file) => {
+        if (!this.settings.autoPopulateFrontmatter) return;
+        
+        // When FM changes, we should update our binding?
+        // But FM is just one source of truth.
+        // If FM changes, getListIdsForFile will naturally return new IDs next time we sync.
+        // However, we might want to sync back to `fileConfigs`?
+        // Actually, `fileConfigs` is "Manual Binding". FM is "Frontmatter Binding".
+        // They are additive.
+        // If user wants FM to drive binding, they edit FM.
+        // If user wants plugin setting to drive binding, they use plugin UI.
+        
+        // Requirement: "sync updating list based on note property".
+        // This is already handled by `getListIdsForFile` which reads FM.
+        // So no explicit event handler needed to "update binding" because binding IS dynamic.
+        
+        // BUT, user also asked: "sync will also update list based on note property"
+        // If they mean "If I change FM, the plugin should immediately know". Yes, `getListIdsForFile` does that.
+        
+        // Wait, there is a reverse requirement: "auto populate frontmatter".
+        // If I change binding via UI, update FM. (Handled in selectListForCurrentFile)
+        // If I change FM, do I need to update UI binding?
+        // The UI binding (`fileConfigs`) is persistent storage. FM is part of file.
+        // If FM changes, we don't necessarily need to write to `fileConfigs`.
+        // `getListIdsForFile` merges them.
+        
+        // However, if `autoPopulateFrontmatter` is ON, we might want to keep them in sync?
+        // If user manually adds a list in FM, should it appear in `fileConfigs`?
+        // Probably not necessary, as long as it works.
+        // But if user removes from FM, it should stop syncing.
+        // If it's also in `fileConfigs`, it will still sync.
+        // This might be confusing.
+        // Ideally: If `autoPopulateFrontmatter` is ON, we treat FM as the PRIMARY source?
+        // Or we keep `fileConfigs` in sync with FM?
+        
+        // Let's implement: If FM changes, we do NOT touch `fileConfigs` automatically,
+        // because `fileConfigs` might store IDs that FM (names) can't resolve yet (e.g. offline).
+        // But `getListIdsForFile` combines them.
+        
+        // The prompt says: "increase list based on note property... sync updating... bidirectional".
+        // "Update list based on note property" -> handled by getListIdsForFile reading FM.
+        
+        // Reverse sync: Frontmatter changed -> update manual config?
+        // Requirement: "sync updating... list will be updated based on note property"
+        // This is handled. But user also asked "increase list based on note property".
+        // If FM adds a list, it is effectively added to the binding.
+        // And "if set here, sync will also update list based on note property".
+        // This means if I add a list in FM, the plugin should respect it. (Done)
+        
+        // Is there any explicit "write back to file config" needed?
+        // If the user wants FM to be the source of truth, we don't need to duplicate it in fileConfigs.
+        // In fact, if autoPopulateFrontmatter is ON, we might want to CLEAR fileConfigs if FM is present,
+        // to avoid duplication or conflict?
+        // Or keep them separate.
+        // Let's keep them additive for safety.
+        
+        // BUT, if FM is removed, we might want to ensure it's not sticking around in fileConfigs if it was put there by auto-population?
+        // This is tricky because we don't track which ID came from where in fileConfigs.
+        // Simplified approach: `fileConfigs` stores MANUAL bindings. FM stores FM bindings.
+        // `selectListForCurrentFile` updates BOTH if auto-pop is on.
+        // If user edits FM manually, `fileConfigs` is untouched.
+        // This seems correct and safe.
+      })
+    );
+
+    this.addRibbonIcon("refresh-cw", "Microsoft To Do Sync: all linked files", async () => {
+      await this.syncLinkedFilesNow();
     });
 
     this.addCommand({
@@ -521,8 +678,17 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.stopAutoSync();
     if (!this.settings.autoSyncEnabled) return;
     const minutes = Math.max(1, Math.floor(this.settings.autoSyncIntervalMinutes || 5));
-    this.autoSyncTimerId = window.setInterval(() => {
-      this.syncMappedFilesTwoWay().catch(error => console.error(error));
+    this.autoSyncTimerId = window.setInterval(async () => {
+      this.updateStatusBar("syncing");
+      try {
+        await this.syncMappedFilesTwoWay();
+      } catch (error) {
+        console.error(error);
+        this.updateStatusBar("error");
+        setTimeout(() => this.updateStatusBar("idle"), 5000);
+        return;
+      }
+      this.updateStatusBar("idle");
     }, minutes * 60 * 1000);
   }
 
@@ -530,6 +696,27 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     if (this.autoSyncTimerId !== null) {
       window.clearInterval(this.autoSyncTimerId);
       this.autoSyncTimerId = null;
+    }
+  }
+
+  updateStatusBar(status: "idle" | "syncing" | "error", text?: string) {
+    if (!this.statusBarItem) return;
+    this.statusBarItem.empty();
+    
+    if (status === "syncing") {
+      this.statusBarItem.createSpan({ cls: "sync-spin", text: "🔄" });
+      this.statusBarItem.createSpan({ text: text || " Syncing..." });
+      this.statusBarItem.setAttribute("aria-label", "Microsoft To Do: Syncing");
+    } else if (status === "error") {
+      this.statusBarItem.createSpan({ text: "⚠️" });
+      this.statusBarItem.createSpan({ text: text || " Sync Error" });
+      this.statusBarItem.setAttribute("aria-label", text || "Microsoft To Do: Sync Error");
+    } else {
+      // Idle state - show a static icon to indicate plugin presence
+      // Using a simple checkmark or the plugin icon
+      this.statusBarItem.createSpan({ text: "✓" }); 
+      this.statusBarItem.createSpan({ text: " MTD" });
+      this.statusBarItem.setAttribute("aria-label", "Microsoft To Do Link: Idle");
     }
   }
 
@@ -546,7 +733,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.configureAutoSync();
   }
 
-  async selectListForCurrentFile() {
+  async selectListForCurrentFile(append: boolean = false) {
     const file = this.getActiveMarkdownFile();
     if (!file) {
       new Notice("No active Markdown file found");
@@ -557,12 +744,103 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       new Notice("No Microsoft To Do lists found");
       return;
     }
-    const current = this.dataModel.fileConfigs[file.path]?.listId || "";
-    const chosen = await this.openListPicker(lists, current);
+    
+    const config = this.dataModel.fileConfigs[file.path];
+    const currentIds = config?.listIds || [];
+    
+    let chosen: string | null = null;
+    if (append) {
+      const available = lists.filter(l => !currentIds.includes(l.id));
+      if (available.length === 0) {
+        new Notice("All available lists are already bound to this file");
+        return;
+      }
+      chosen = await this.openListPicker(available, "");
+    } else {
+      chosen = await this.openListPicker(lists, currentIds.length > 0 ? currentIds[0] : "");
+    }
+    
     if (!chosen) return;
-    this.dataModel.fileConfigs[file.path] = { listId: chosen };
+    
+    let newIds: string[];
+    if (append) {
+      newIds = [...currentIds, chosen];
+    } else {
+      newIds = [chosen];
+    }
+    
+    this.dataModel.fileConfigs[file.path] = { listIds: newIds };
     await this.saveDataModel();
-    new Notice("List set for current file");
+
+    // Auto-update frontmatter if enabled
+    if (this.settings.autoPopulateFrontmatter) {
+      await this.updateFrontmatterBinding(file, newIds, lists);
+    }
+    
+    const listNames = lists.filter(l => newIds.includes(l.id)).map(l => l.displayName).join(", ");
+    new Notice(`Bound to: ${listNames}`);
+  }
+  
+  async addMultipleListsForCurrentFile() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("No active Markdown file found");
+      return;
+    }
+    const lists = await this.fetchTodoLists(true);
+    if (lists.length === 0) {
+      new Notice("No Microsoft To Do lists found");
+      return;
+    }
+    
+    const config = this.dataModel.fileConfigs[file.path];
+    const currentIds = new Set(config?.listIds || []);
+    
+    // Custom UI for multi-select could be implemented as a Modal with toggles
+    // For simplicity, we can reuse ListSelectModal but allow multiple? 
+    // Or just a simple prompt? No, Obsidian API doesn't have multi-select prompt built-in.
+    // Let's implement a simple MultiSelectModal class below.
+    
+    const selected = await new Promise<string[] | null>((resolve) => {
+      new ListMultiSelectModal(this.app, lists, Array.from(currentIds), resolve).open();
+    });
+    
+    if (!selected) return; // User cancelled
+    
+    // Merge new selections with existing? Or replace?
+    // "Add multiple lists" implies adding. But usually multi-select UI shows current state.
+    // Let's assume the modal returns the FINAL set of IDs desired.
+    
+    this.dataModel.fileConfigs[file.path] = { listIds: selected };
+    await this.saveDataModel();
+
+    if (this.settings.autoPopulateFrontmatter) {
+      await this.updateFrontmatterBinding(file, selected, lists);
+    }
+    
+    new Notice(`Bound ${selected.length} lists`);
+  }
+
+  private async updateFrontmatterBinding(file: TFile, listIds: string[], allLists: GraphTodoList[]) {
+    try {
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        const listNames = listIds
+          .map(id => allLists.find(l => l.id === id)?.displayName)
+          .filter(n => !!n) as string[];
+        
+        if (listNames.length > 0) {
+          frontmatter["microsoft-todo-list"] = listNames;
+          // Remove legacy if present
+          delete frontmatter["mtd-list"];
+        } else {
+          delete frontmatter["microsoft-todo-list"];
+          delete frontmatter["mtd-list"];
+        }
+      });
+    } catch (e) {
+      console.error("Failed to update frontmatter", e);
+      new Notice("Failed to update frontmatter binding");
+    }
   }
 
   async clearSyncStateForCurrentFile() {
@@ -595,33 +873,106 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     }
   }
 
+  private async ensureFrontmatterSynced(file: TFile, listIds: string[]) {
+    if (!this.settings.autoPopulateFrontmatter) return;
+    if (this.todoListsCache.length === 0) {
+      await this.fetchTodoLists(false);
+    }
+    
+    // We only update if there's a difference to avoid constant IO
+    // But we need to check current frontmatter
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fm = cache?.frontmatter;
+    const currentRaw = fm ? (fm["microsoft-todo-list"] || fm["mtd-list"]) : undefined;
+    
+    const currentNames = new Set<string>();
+    if (currentRaw) {
+      const arr = Array.isArray(currentRaw) ? currentRaw : [String(currentRaw)];
+      arr.forEach(n => currentNames.add(n.trim().toLowerCase()));
+    }
+    
+    const targetNames = listIds
+      .map(id => this.todoListsCache.find(l => l.id === id)?.displayName)
+      .filter(n => !!n) as string[];
+      
+    // Check if target names are already in current names
+    const allPresent = targetNames.every(n => currentNames.has(n.toLowerCase()));
+    const sameCount = currentNames.size === targetNames.length;
+    
+    // If exact match, skip
+    if (allPresent && sameCount) return;
+    
+    // If not match, update
+    await this.updateFrontmatterBinding(file, listIds, this.todoListsCache);
+  }
+
   async syncCurrentFileNow() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
       new Notice("No active Markdown file found");
       return;
     }
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    
+    this.updateStatusBar("syncing");
+    
+    // Ensure cache is loaded so getListIdsForFile can resolve frontmatter names
+    await this.fetchTodoLists(false);
+
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
+      this.updateStatusBar("idle");
       new Notice("Please select a default list in settings or for the current file");
       return;
     }
+    
+    // Auto-populate frontmatter if needed
+    await this.ensureFrontmatterSynced(file, listIds);
+
     try {
-      const added = await this.pullTodoTasksIntoFile(file, listId, false);
-      const childAdded = await this.pullChecklistIntoFile(file, listId);
+      // Pull from all bound lists
+      let addedTotal = 0;
+      let childAddedTotal = 0;
+      
+      // We need list details to generate dynamic tags if multiple lists are bound
+      const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+      const listMap = new Map(allLists.map(l => [l.id, l.displayName]));
+
+      for (const listId of listIds) {
+        // If multiple lists, append specific tag
+        let suffixTag: string | undefined = undefined;
+        if (listIds.length > 1) {
+          const name = listMap.get(listId) || "List";
+          // Sanitize list name for tag (remove spaces, special chars)
+          const safeName = name.replace(/[\s\W]+/g, "-");
+          suffixTag = `-${safeName}`;
+        }
+
+        const added = await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+        const childAdded = await this.pullChecklistIntoFile(file, listId, suffixTag);
+        addedTotal += added;
+        childAddedTotal += childAdded;
+      }
+
       await this.syncFileTwoWay(file);
-      if (added + childAdded > 0) {
+      
+      if (addedTotal + childAddedTotal > 0) {
         const parts: string[] = [];
-        if (added > 0) parts.push(`Added tasks: ${added}`);
-        if (childAdded > 0) parts.push(`Added subtasks: ${childAdded}`);
+        if (addedTotal > 0) parts.push(`Added tasks: ${addedTotal}`);
+        if (childAddedTotal > 0) parts.push(`Added subtasks: ${childAddedTotal}`);
         new Notice(`Sync completed (Pulled: ${parts.join(", ")})`);
       } else {
         new Notice("Sync completed");
       }
     } catch (error) {
       console.error(error);
+      this.updateStatusBar("error");
       new Notice(normalizeErrorMessage(error) || "Sync failed, check console for details");
+      // Clear error after a while
+      setTimeout(() => this.updateStatusBar("idle"), 5000);
+      return;
     }
+    
+    this.updateStatusBar("idle");
   }
 
   async pullTodoIntoCurrentFile() {
@@ -630,25 +981,54 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       new Notice("No active Markdown file found");
       return;
     }
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    
+    this.updateStatusBar("syncing", " Pulling...");
+    
+    // Ensure cache is loaded so getListIdsForFile can resolve frontmatter names
+    await this.fetchTodoLists(false);
+
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
+      this.updateStatusBar("idle");
       new Notice("Please select a default list in settings or for the current file");
       return;
     }
+    
+    // Auto-populate frontmatter if needed
+    await this.ensureFrontmatterSynced(file, listIds);
+
     try {
-      const added = await this.pullTodoTasksIntoFile(file, listId, true);
-      if (added === 0) {
+      let addedTotal = 0;
+      const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+      const listMap = new Map(allLists.map(l => [l.id, l.displayName]));
+
+      for (const listId of listIds) {
+        let suffixTag: string | undefined = undefined;
+        if (listIds.length > 1) {
+          const name = listMap.get(listId) || "List";
+          const safeName = name.replace(/[\s\W]+/g, "-");
+          suffixTag = `-${safeName}`;
+        }
+        addedTotal += await this.pullTodoTasksIntoFile(file, listId, true, suffixTag);
+      }
+
+      if (addedTotal === 0) {
         new Notice("No new tasks to pull");
       } else {
-        new Notice(`Pulled ${added} tasks to current file`);
+        new Notice(`Pulled ${addedTotal} tasks to current file`);
       }
     } catch (error) {
       console.error(error);
+      this.updateStatusBar("error");
       new Notice(normalizeErrorMessage(error) || "Pull failed, check console for details");
+      setTimeout(() => this.updateStatusBar("idle"), 5000);
+      return;
     }
+    
+    this.updateStatusBar("idle");
   }
 
-  private async pullTodoTasksIntoFile(file: TFile, listId: string, syncAfter: boolean): Promise<number> {
+  private async pullTodoTasksIntoFile(file: TFile, listId: string, syncAfter: boolean, tagSuffix?: string): Promise<number> {
     await this.getValidAccessToken();
     const remoteTasks = await this.graph.listTasks(listId, 200, true);
     const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map(m => m.graphTaskId));
@@ -660,7 +1040,22 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
     const insertAt = this.resolvePullInsertIndex(lines, file);
-    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
+    
+    let tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
+    if (tagSuffix && tagForPull) {
+      tagForPull = `${tagForPull}${tagSuffix}`;
+    } else if (tagSuffix) {
+      // If base tag is disabled but suffix provided (multi-list), maybe we should use a default base or just the suffix?
+      // User requirement: "MTD-LIST1". Assuming MTD is base.
+      // If base tag disabled, we probably shouldn't add tags at all OR we should only add the suffix part if critical.
+      // Let's assume if multi-list is active, we force the tag format MTD-Listname.
+      // So we fallback to default base tag if user disabled it? Or just use suffix.
+      // User said "比如原本MTD，现在绑定两个就是MTD-LIST1".
+      // So we use base tag (or default) + suffix.
+      const base = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : "MicrosoftTodo";
+      tagForPull = `${base}${tagSuffix}`;
+    }
+
     const insertLines: string[] = [];
 
     const fileMtime = file.stat.mtime;
@@ -731,15 +1126,25 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     return added;
   }
 
-  private async pullChecklistIntoFile(file: TFile, listId: string): Promise<number> {
+  private async pullChecklistIntoFile(file: TFile, listId: string, tagSuffix?: string): Promise<number> {
     await this.getValidAccessToken();
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
+    
+    let tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
+    if (tagSuffix && tagForPull) {
+      tagForPull = `${tagForPull}${tagSuffix}`;
+    } else if (tagSuffix) {
+      const base = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : "MicrosoftTodo";
+      tagForPull = `${base}${tagSuffix}`;
+    }
 
     let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     if (tasks.length === 0) return 0;
-
+    
+    // ... rest of implementation needs minor updates to use tagForPull if needed for new items
+    // But check below, the tagForPull is only used when creating NEW child items from Remote
+    
     let changed = false;
     const ensured = ensureBlockIds(lines, tasks);
     if (ensured.changed) {
@@ -771,7 +1176,9 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     for (const parent of parents) {
       const mappingKey = buildMappingKey(file.path, parent.blockId);
       const parentEntry = this.dataModel.taskMappings[mappingKey];
-      if (!parentEntry) continue;
+      
+      // Strict listId match: only pull checklist items for parents belonging to the current listId
+      if (!parentEntry || parentEntry.listId !== listId) continue;
 
       let remoteItems: GraphChecklistItem[];
       try {
@@ -882,6 +1289,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       new Notice("No linked files found");
       return;
     }
+    
+    this.updateStatusBar("syncing");
+    
+    // Pre-fetch list cache for all files
+    await this.fetchTodoLists(false);
 
     const sorted = [...filePaths].sort((a, b) => a.localeCompare(b));
     let synced = 0;
@@ -894,21 +1306,37 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (!(file instanceof TFile)) continue;
       if (file.extension !== "md") continue;
 
-      const listId = this.getListIdForFile(file.path);
-      if (!listId) {
+      const listIds = this.getListIdsForFile(file.path);
+      if (listIds.length === 0) {
         skippedNoList++;
         continue;
       }
+      
+      // Auto-populate frontmatter if needed (async but we wait)
+      await this.ensureFrontmatterSynced(file, listIds);
 
       try {
-        pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false);
-        pulledSubtasks += await this.pullChecklistIntoFile(file, listId);
+        const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+        const listMap = new Map(allLists.map(l => [l.id, l.displayName]));
+
+        for (const listId of listIds) {
+          let suffixTag: string | undefined = undefined;
+          if (listIds.length > 1) {
+            const name = listMap.get(listId) || "List";
+            const safeName = name.replace(/[\s\W]+/g, "-");
+            suffixTag = `-${safeName}`;
+          }
+          pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+          pulledSubtasks += await this.pullChecklistIntoFile(file, listId, suffixTag);
+        }
         await this.syncFileTwoWay(file);
         synced++;
       } catch (error) {
         console.error(error);
       }
     }
+    
+    this.updateStatusBar("idle");
 
     if (synced === 0) {
       new Notice(skippedNoList > 0 ? "No files synced (missing list configuration)" : "No files synced");
@@ -923,11 +1351,22 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   }
 
   async syncFileTwoWay(file: TFile) {
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    // Ensure cache is loaded so getListIdsForFile can resolve frontmatter names
+    if (this.todoListsCache.length === 0) {
+      await this.fetchTodoLists(false);
+    }
+
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
       new Notice("Please select a default list in settings or for the current file");
       return;
     }
+    
+    // Auto-populate frontmatter if needed
+    await this.ensureFrontmatterSynced(file, listIds);
+    
+    // We treat the FIRST list as the "default" for new tasks if no mapping exists
+    const defaultListId = listIds[0];
 
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
@@ -1048,11 +1487,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         const parentMappingKey = buildMappingKey(file.path, parentTask.blockId);
         let parentEntry = this.dataModel.taskMappings[parentMappingKey];
         if (!parentEntry) {
-          const createdParent = await this.graph.createTask(listId, parentTask.title, parentTask.completed, parentTask.dueDate);
+          const createdParent = await this.graph.createTask(defaultListId, parentTask.title, parentTask.completed, parentTask.dueDate);
           const graphHash = hashGraphTask(createdParent);
           const localHash = hashTask(parentTask.title, parentTask.completed, parentTask.dueDate);
           parentEntry = {
-            listId,
+            listId: defaultListId,
             graphTaskId: createdParent.id,
             lastSyncedAt: Date.now(),
             lastSyncedLocalHash: localHash,
@@ -1186,10 +1625,10 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const localHash = hashTask(task.title, task.completed, task.dueDate);
 
       if (!existing) {
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
+        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId,
+          listId: defaultListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1200,28 +1639,16 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         continue;
       }
 
-      if (existing.listId !== listId) {
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
-        const graphHash = hashGraphTask(created);
-        this.dataModel.taskMappings[mappingKey] = {
-          listId,
-          graphTaskId: created.id,
-          lastSyncedAt: Date.now(),
-          lastSyncedLocalHash: localHash,
-          lastSyncedGraphHash: graphHash,
-          lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: created.lastModifiedDateTime
-        };
-        continue;
-      }
-
+      // Check if existing mapping listId is still valid?
+      // Actually we trust the mapping. Even if file config changed, we keep existing tasks where they are unless user deletes them.
+      
       const remote = await this.graph.getTask(existing.listId, existing.graphTaskId);
       if (!remote) {
         delete this.dataModel.taskMappings[mappingKey];
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
+        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId,
+          listId: defaultListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1369,8 +1796,40 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     await this.saveDataModel();
   }
 
-  private getListIdForFile(filePath: string): string {
-    return this.dataModel.fileConfigs[filePath]?.listId || this.settings.defaultListId;
+  private getListIdsForFile(filePath: string): string[] {
+    const ids = new Set<string>();
+    
+    // 1. Manual config
+    const config = this.dataModel.fileConfigs[filePath];
+    if (config?.listIds && config.listIds.length > 0) {
+      config.listIds.forEach(id => ids.add(id));
+    }
+
+    // 2. Frontmatter config (microsoft-todo-list / mtd-list)
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (file instanceof TFile && this.todoListsCache.length > 0) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const fm = cache?.frontmatter;
+      if (fm) {
+        const raw = fm["microsoft-todo-list"] || fm["mtd-list"];
+        if (raw) {
+          const names = Array.isArray(raw) ? raw : [String(raw)];
+          for (const name of names) {
+            const cleanName = name.trim().toLowerCase();
+            // Try to match by displayName (case-insensitive)
+            const match = this.todoListsCache.find(l => l.displayName.toLowerCase() === cleanName);
+            if (match) ids.add(match.id);
+          }
+        }
+      }
+    }
+
+    // 3. Fallback
+    if (ids.size === 0) {
+      return this.settings.defaultListId ? [this.settings.defaultListId] : [];
+    }
+    
+    return Array.from(ids);
   }
 
   private getLinkedFilePaths(): string[] {
@@ -1388,6 +1847,16 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
     addFromMappingKeys(this.dataModel.taskMappings);
     addFromMappingKeys(this.dataModel.checklistMappings);
+
+    const markdownFiles = this.app.vault.getMarkdownFiles();
+    for (const file of markdownFiles) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const fm = cache?.frontmatter;
+      if (!fm) continue;
+      if (fm["microsoft-todo-list"] || fm["mtd-list"]) {
+        paths.add(file.path);
+      }
+    }
 
     return Array.from(paths);
   }
@@ -1568,7 +2037,19 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
 
   const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object";
 
-  const fileConfigs = isRecord(obj.fileConfigs) ? (obj.fileConfigs as Record<string, FileSyncConfig>) : {};
+  // Migration for listId -> listIds
+  const fileConfigsRaw = isRecord(obj.fileConfigs) ? obj.fileConfigs : {};
+  const fileConfigs: Record<string, FileSyncConfig> = {};
+  for (const [key, val] of Object.entries(fileConfigsRaw)) {
+    if (isRecord(val)) {
+      const existingIds = Array.isArray(val.listIds) ? val.listIds : [];
+      if ("listId" in val && typeof val.listId === "string" && val.listId) {
+        if (!existingIds.includes(val.listId)) existingIds.push(val.listId);
+      }
+      fileConfigs[key] = { listIds: existingIds };
+    }
+  }
+
   const taskMappings = isRecord(obj.taskMappings) ? (obj.taskMappings as Record<string, TaskMappingEntry>) : {};
   const checklistMappings = isRecord(obj.checklistMappings) ? (obj.checklistMappings as Record<string, ChecklistMappingEntry>) : {};
 
@@ -1618,7 +2099,8 @@ function migrateDataModel(raw: unknown): Partial<PluginDataModel> {
       pullInsertLocation,
       pullAppendTagEnabled:
         typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
-      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag
+      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag,
+      autoPopulateFrontmatter: typeof settingsRaw.autoPopulateFrontmatter === "boolean" ? settingsRaw.autoPopulateFrontmatter : DEFAULT_SETTINGS.autoPopulateFrontmatter
     };
 
     return {
@@ -1804,7 +2286,7 @@ function sanitizeTitleForGraph(title: string): string {
   if (!input) return "";
   const withoutIds = input
     .replace(/\^mtdc?_[a-z0-9_]+/gi, " ")
-    .replace(/<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*mtdc?_[a-z0-9_]+\s*-->/gi, " ")
+    .replace(/<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*-->/gi, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
   return withoutIds;
@@ -2099,7 +2581,14 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       deletion_detach: isZh ? "仅解除绑定（保留云端任务）" : "Detach only (keep remote task)",
       current_file_binding: isZh ? "当前文件列表绑定" : "Current file list binding",
       current_file_binding_desc: isZh ? "为当前活动文件选择列表" : "Select list for active file",
-      clear_sync_state: isZh ? "清除同步状态" : "Clear sync state"
+      clear_sync_state: isZh ? "清除同步状态" : "Clear sync state",
+      auto_populate_frontmatter: isZh ? "自动填写笔记属性" : "Auto-populate frontmatter",
+      auto_populate_frontmatter_desc: isZh ? "绑定变更时自动更新笔记属性，属性变更时自动更新绑定" : "Update frontmatter on binding change, and update binding on frontmatter change",
+      select_list_tooltip: isZh ? "覆盖当前所选列表" : "Overwrite binding with a new list",
+      add_list: isZh ? "追加列表" : "Add List",
+      add_list_tooltip: isZh ? "追加单个列表到绑定中" : "Append another list to binding",
+      add_multiple: isZh ? "批量追加" : "Add Multiple",
+      add_multiple_tooltip: isZh ? "批量选择列表并覆盖/设置当前绑定" : "Select multiple lists to bind"
     };
     this.t = (key: string) => dict[key] ?? key;
   }
@@ -2366,18 +2855,83 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName(this.t("auto_populate_frontmatter"))
+      .setDesc(this.t("auto_populate_frontmatter_desc"))
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.autoPopulateFrontmatter).onChange(async value => {
+          this.plugin.settings.autoPopulateFrontmatter = value;
+          await this.plugin.saveDataModel();
+        })
+      );
+
+    new Setting(containerEl)
       .setName(this.t("current_file_binding"))
       .setDesc(this.t("current_file_binding_desc"))
       .addButton(btn =>
-        btn.setButtonText(this.t("select_list")).onClick(async () => {
-          await this.plugin.selectListForCurrentFile();
+        btn.setButtonText(this.t("select_list")).setTooltip(this.t("select_list_tooltip")).onClick(async () => {
+          await this.plugin.selectListForCurrentFile(false); // false = overwrite
+          this.display();
+        })
+      )
+      .addButton(btn => 
+        btn.setButtonText(`+ ${this.t("add_list")}`).setTooltip(this.t("add_list_tooltip")).onClick(async () => {
+             await this.plugin.selectListForCurrentFile(true); // true = append
+             this.display();
+        })
+      )
+      .addButton(btn =>
+        btn.setButtonText(`+ ${this.t("add_multiple")}`).setTooltip(this.t("add_multiple_tooltip")).onClick(async () => {
+             await this.plugin.addMultipleListsForCurrentFile();
+             this.display();
         })
       )
       .addButton(btn =>
         btn.setButtonText(this.t("clear_sync_state")).onClick(async () => {
           await this.plugin.clearSyncStateForCurrentFile();
+          this.display();
         })
       );
+
+    // Show current binding info if a file is active
+    const activeFile = this.plugin.app.workspace.getActiveViewOfType(MarkdownView)?.file;
+    if (activeFile) {
+      new Setting(containerEl).setName(this.t("current_file_info") || "Active File Info").setHeading();
+      
+      const config = this.plugin.dataModel.fileConfigs[activeFile.path];
+      const manualIds = config?.listIds || [];
+      
+      let frontmatterRaw = "";
+      const cache = this.plugin.app.metadataCache.getFileCache(activeFile);
+      const fm = cache?.frontmatter;
+      if (fm) {
+        const raw = fm["microsoft-todo-list"] || fm["mtd-list"];
+        if (raw) {
+           frontmatterRaw = Array.isArray(raw) ? raw.join(", ") : String(raw);
+        }
+      }
+
+      if (manualIds.length > 0) {
+        // Resolve manual IDs to names
+        const listMap = new Map(this.plugin.todoListsCache.map(l => [l.id, l.displayName]));
+        const manualNames = manualIds.map(id => listMap.get(id) || `Unknown ID (${id})`);
+
+        new Setting(containerEl)
+          .setName("Manually Bound Lists")
+          .setDesc("Lists bound via plugin settings")
+          .addTextArea(text => text.setValue(manualNames.join("\n")).setDisabled(true));
+      }
+      
+      if (frontmatterRaw) {
+        new Setting(containerEl)
+          .setName("Frontmatter Binding")
+          .setDesc("Lists defined in note properties (microsoft-todo-list)")
+          .addText(text => text.setValue(frontmatterRaw).setDisabled(true));
+      }
+      
+      if (manualIds.length === 0 && !frontmatterRaw) {
+         new Setting(containerEl).setDesc("No lists bound to this file (will use Default List)");
+      }
+    }
   }
 }
 

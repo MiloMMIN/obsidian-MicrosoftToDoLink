@@ -41,7 +41,8 @@ var DEFAULT_SETTINGS = {
   pullHeadingLevel: 2,
   pullInsertLocation: "bottom",
   pullAppendTagEnabled: false,
-  pullAppendTag: "MicrosoftTodo"
+  pullAppendTag: "MicrosoftTodo",
+  autoPopulateFrontmatter: false
 };
 var BLOCK_ID_PREFIX = "mtd_";
 var CHECKLIST_BLOCK_ID_PREFIX = "mtdc_";
@@ -195,6 +196,70 @@ var ListSelectModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+var ListMultiSelectModal = class extends import_obsidian.Modal {
+  constructor(app, lists, selectedIds, resolve) {
+    super(app);
+    __publicField(this, "lists");
+    __publicField(this, "selectedIds");
+    __publicField(this, "resolve");
+    this.lists = lists;
+    this.selectedIds = new Set(selectedIds);
+    this.resolve = resolve;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    new import_obsidian.Setting(contentEl).setName("Select Microsoft To Do lists").setHeading();
+    contentEl.createDiv({ text: "Select one or more lists to bind:", cls: "setting-item-description" });
+    const listContainer = contentEl.createDiv();
+    listContainer.style.maxHeight = "300px";
+    listContainer.style.overflowY = "auto";
+    listContainer.style.marginTop = "10px";
+    listContainer.style.border = "1px solid var(--background-modifier-border)";
+    listContainer.style.padding = "10px";
+    listContainer.style.borderRadius = "4px";
+    for (const list of this.lists) {
+      const row = listContainer.createDiv();
+      row.style.display = "flex";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "5px";
+      const checkbox = row.createEl("input", { type: "checkbox" });
+      checkbox.checked = this.selectedIds.has(list.id);
+      checkbox.onchange = (e) => {
+        if (e.target.checked) {
+          this.selectedIds.add(list.id);
+        } else {
+          this.selectedIds.delete(list.id);
+        }
+      };
+      const label = row.createEl("label", { text: list.displayName });
+      label.style.marginLeft = "8px";
+      label.onclick = () => {
+        var _a;
+        checkbox.checked = !checkbox.checked;
+        (_a = checkbox.onchange) == null ? void 0 : _a.call(checkbox, { target: checkbox });
+      };
+    }
+    const buttonRow = contentEl.createDiv({ cls: "mtd-button-row" });
+    buttonRow.setCssProps({ marginTop: "15px" });
+    buttonRow.style.display = "flex";
+    buttonRow.style.justifyContent = "flex-end";
+    buttonRow.style.gap = "10px";
+    const cancelBtn = buttonRow.createEl("button", { text: "Cancel" });
+    const okBtn = buttonRow.createEl("button", { text: "Save", cls: "mod-cta" });
+    cancelBtn.onclick = () => {
+      this.resolve(null);
+      this.close();
+    };
+    okBtn.onclick = () => {
+      this.resolve(Array.from(this.selectedIds));
+      this.close();
+    };
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
@@ -204,12 +269,24 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "autoSyncTimerId", null);
     __publicField(this, "loginInProgress", false);
     __publicField(this, "pendingDeviceCode", null);
+    __publicField(this, "statusBarItem", null);
   }
   async onload() {
     await this.loadDataModel();
     this.graph = new GraphClient(this);
-    this.addRibbonIcon("refresh-cw", "Microsoft To Do Sync: current file", async () => {
-      await this.syncCurrentFileNow();
+    if (this.app.metadataTypeManager) {
+      this.app.metadataTypeManager.setType("microsoft-todo-list", "multitext");
+      this.app.metadataTypeManager.setType("mtd-list", "multitext");
+    }
+    this.statusBarItem = this.addStatusBarItem();
+    this.updateStatusBar("idle");
+    this.registerEvent(
+      this.app.metadataCache.on("changed", async (file) => {
+        if (!this.settings.autoPopulateFrontmatter) return;
+      })
+    );
+    this.addRibbonIcon("refresh-cw", "Microsoft To Do Sync: all linked files", async () => {
+      await this.syncLinkedFilesNow();
     });
     this.addCommand({
       id: "sync-current-file-two-way",
@@ -373,14 +450,40 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     this.stopAutoSync();
     if (!this.settings.autoSyncEnabled) return;
     const minutes = Math.max(1, Math.floor(this.settings.autoSyncIntervalMinutes || 5));
-    this.autoSyncTimerId = window.setInterval(() => {
-      this.syncMappedFilesTwoWay().catch((error) => console.error(error));
+    this.autoSyncTimerId = window.setInterval(async () => {
+      this.updateStatusBar("syncing");
+      try {
+        await this.syncMappedFilesTwoWay();
+      } catch (error) {
+        console.error(error);
+        this.updateStatusBar("error");
+        setTimeout(() => this.updateStatusBar("idle"), 5e3);
+        return;
+      }
+      this.updateStatusBar("idle");
     }, minutes * 60 * 1e3);
   }
   stopAutoSync() {
     if (this.autoSyncTimerId !== null) {
       window.clearInterval(this.autoSyncTimerId);
       this.autoSyncTimerId = null;
+    }
+  }
+  updateStatusBar(status, text) {
+    if (!this.statusBarItem) return;
+    this.statusBarItem.empty();
+    if (status === "syncing") {
+      this.statusBarItem.createSpan({ cls: "sync-spin", text: "\u{1F504}" });
+      this.statusBarItem.createSpan({ text: text || " Syncing..." });
+      this.statusBarItem.setAttribute("aria-label", "Microsoft To Do: Syncing");
+    } else if (status === "error") {
+      this.statusBarItem.createSpan({ text: "\u26A0\uFE0F" });
+      this.statusBarItem.createSpan({ text: text || " Sync Error" });
+      this.statusBarItem.setAttribute("aria-label", text || "Microsoft To Do: Sync Error");
+    } else {
+      this.statusBarItem.createSpan({ text: "\u2713" });
+      this.statusBarItem.createSpan({ text: " MTD" });
+      this.statusBarItem.setAttribute("aria-label", "Microsoft To Do Link: Idle");
     }
   }
   async selectDefaultListWithUi() {
@@ -395,8 +498,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     await this.saveDataModel();
     this.configureAutoSync();
   }
-  async selectListForCurrentFile() {
-    var _a;
+  async selectListForCurrentFile(append = false) {
     const file = this.getActiveMarkdownFile();
     if (!file) {
       new import_obsidian.Notice("No active Markdown file found");
@@ -407,12 +509,77 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("No Microsoft To Do lists found");
       return;
     }
-    const current = ((_a = this.dataModel.fileConfigs[file.path]) == null ? void 0 : _a.listId) || "";
-    const chosen = await this.openListPicker(lists, current);
+    const config = this.dataModel.fileConfigs[file.path];
+    const currentIds = (config == null ? void 0 : config.listIds) || [];
+    let chosen = null;
+    if (append) {
+      const available = lists.filter((l) => !currentIds.includes(l.id));
+      if (available.length === 0) {
+        new import_obsidian.Notice("All available lists are already bound to this file");
+        return;
+      }
+      chosen = await this.openListPicker(available, "");
+    } else {
+      chosen = await this.openListPicker(lists, currentIds.length > 0 ? currentIds[0] : "");
+    }
     if (!chosen) return;
-    this.dataModel.fileConfigs[file.path] = { listId: chosen };
+    let newIds;
+    if (append) {
+      newIds = [...currentIds, chosen];
+    } else {
+      newIds = [chosen];
+    }
+    this.dataModel.fileConfigs[file.path] = { listIds: newIds };
     await this.saveDataModel();
-    new import_obsidian.Notice("List set for current file");
+    if (this.settings.autoPopulateFrontmatter) {
+      await this.updateFrontmatterBinding(file, newIds, lists);
+    }
+    const listNames = lists.filter((l) => newIds.includes(l.id)).map((l) => l.displayName).join(", ");
+    new import_obsidian.Notice(`Bound to: ${listNames}`);
+  }
+  async addMultipleListsForCurrentFile() {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new import_obsidian.Notice("No active Markdown file found");
+      return;
+    }
+    const lists = await this.fetchTodoLists(true);
+    if (lists.length === 0) {
+      new import_obsidian.Notice("No Microsoft To Do lists found");
+      return;
+    }
+    const config = this.dataModel.fileConfigs[file.path];
+    const currentIds = new Set((config == null ? void 0 : config.listIds) || []);
+    const selected = await new Promise((resolve) => {
+      new ListMultiSelectModal(this.app, lists, Array.from(currentIds), resolve).open();
+    });
+    if (!selected) return;
+    this.dataModel.fileConfigs[file.path] = { listIds: selected };
+    await this.saveDataModel();
+    if (this.settings.autoPopulateFrontmatter) {
+      await this.updateFrontmatterBinding(file, selected, lists);
+    }
+    new import_obsidian.Notice(`Bound ${selected.length} lists`);
+  }
+  async updateFrontmatterBinding(file, listIds, allLists) {
+    try {
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        const listNames = listIds.map((id) => {
+          var _a;
+          return (_a = allLists.find((l) => l.id === id)) == null ? void 0 : _a.displayName;
+        }).filter((n) => !!n);
+        if (listNames.length > 0) {
+          frontmatter["microsoft-todo-list"] = listNames;
+          delete frontmatter["mtd-list"];
+        } else {
+          delete frontmatter["microsoft-todo-list"];
+          delete frontmatter["mtd-list"];
+        }
+      });
+    } catch (e) {
+      console.error("Failed to update frontmatter", e);
+      new import_obsidian.Notice("Failed to update frontmatter binding");
+    }
   }
   async clearSyncStateForCurrentFile() {
     const file = this.getActiveMarkdownFile();
@@ -442,33 +609,77 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("Sync failed, check console for details");
     }
   }
+  async ensureFrontmatterSynced(file, listIds) {
+    if (!this.settings.autoPopulateFrontmatter) return;
+    if (this.todoListsCache.length === 0) {
+      await this.fetchTodoLists(false);
+    }
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fm = cache == null ? void 0 : cache.frontmatter;
+    const currentRaw = fm ? fm["microsoft-todo-list"] || fm["mtd-list"] : void 0;
+    const currentNames = /* @__PURE__ */ new Set();
+    if (currentRaw) {
+      const arr = Array.isArray(currentRaw) ? currentRaw : [String(currentRaw)];
+      arr.forEach((n) => currentNames.add(n.trim().toLowerCase()));
+    }
+    const targetNames = listIds.map((id) => {
+      var _a;
+      return (_a = this.todoListsCache.find((l) => l.id === id)) == null ? void 0 : _a.displayName;
+    }).filter((n) => !!n);
+    const allPresent = targetNames.every((n) => currentNames.has(n.toLowerCase()));
+    const sameCount = currentNames.size === targetNames.length;
+    if (allPresent && sameCount) return;
+    await this.updateFrontmatterBinding(file, listIds, this.todoListsCache);
+  }
   async syncCurrentFileNow() {
     const file = this.getActiveMarkdownFile();
     if (!file) {
       new import_obsidian.Notice("No active Markdown file found");
       return;
     }
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    this.updateStatusBar("syncing");
+    await this.fetchTodoLists(false);
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
+      this.updateStatusBar("idle");
       new import_obsidian.Notice("Please select a default list in settings or for the current file");
       return;
     }
+    await this.ensureFrontmatterSynced(file, listIds);
     try {
-      const added = await this.pullTodoTasksIntoFile(file, listId, false);
-      const childAdded = await this.pullChecklistIntoFile(file, listId);
+      let addedTotal = 0;
+      let childAddedTotal = 0;
+      const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+      const listMap = new Map(allLists.map((l) => [l.id, l.displayName]));
+      for (const listId of listIds) {
+        let suffixTag = void 0;
+        if (listIds.length > 1) {
+          const name = listMap.get(listId) || "List";
+          const safeName = name.replace(/[\s\W]+/g, "-");
+          suffixTag = `-${safeName}`;
+        }
+        const added = await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+        const childAdded = await this.pullChecklistIntoFile(file, listId, suffixTag);
+        addedTotal += added;
+        childAddedTotal += childAdded;
+      }
       await this.syncFileTwoWay(file);
-      if (added + childAdded > 0) {
+      if (addedTotal + childAddedTotal > 0) {
         const parts = [];
-        if (added > 0) parts.push(`Added tasks: ${added}`);
-        if (childAdded > 0) parts.push(`Added subtasks: ${childAdded}`);
+        if (addedTotal > 0) parts.push(`Added tasks: ${addedTotal}`);
+        if (childAddedTotal > 0) parts.push(`Added subtasks: ${childAddedTotal}`);
         new import_obsidian.Notice(`Sync completed (Pulled: ${parts.join(", ")})`);
       } else {
         new import_obsidian.Notice("Sync completed");
       }
     } catch (error) {
       console.error(error);
+      this.updateStatusBar("error");
       new import_obsidian.Notice(normalizeErrorMessage(error) || "Sync failed, check console for details");
+      setTimeout(() => this.updateStatusBar("idle"), 5e3);
+      return;
     }
+    this.updateStatusBar("idle");
   }
   async pullTodoIntoCurrentFile() {
     const file = this.getActiveMarkdownFile();
@@ -476,24 +687,43 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("No active Markdown file found");
       return;
     }
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    this.updateStatusBar("syncing", " Pulling...");
+    await this.fetchTodoLists(false);
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
+      this.updateStatusBar("idle");
       new import_obsidian.Notice("Please select a default list in settings or for the current file");
       return;
     }
+    await this.ensureFrontmatterSynced(file, listIds);
     try {
-      const added = await this.pullTodoTasksIntoFile(file, listId, true);
-      if (added === 0) {
+      let addedTotal = 0;
+      const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+      const listMap = new Map(allLists.map((l) => [l.id, l.displayName]));
+      for (const listId of listIds) {
+        let suffixTag = void 0;
+        if (listIds.length > 1) {
+          const name = listMap.get(listId) || "List";
+          const safeName = name.replace(/[\s\W]+/g, "-");
+          suffixTag = `-${safeName}`;
+        }
+        addedTotal += await this.pullTodoTasksIntoFile(file, listId, true, suffixTag);
+      }
+      if (addedTotal === 0) {
         new import_obsidian.Notice("No new tasks to pull");
       } else {
-        new import_obsidian.Notice(`Pulled ${added} tasks to current file`);
+        new import_obsidian.Notice(`Pulled ${addedTotal} tasks to current file`);
       }
     } catch (error) {
       console.error(error);
+      this.updateStatusBar("error");
       new import_obsidian.Notice(normalizeErrorMessage(error) || "Pull failed, check console for details");
+      setTimeout(() => this.updateStatusBar("idle"), 5e3);
+      return;
     }
+    this.updateStatusBar("idle");
   }
-  async pullTodoTasksIntoFile(file, listId, syncAfter) {
+  async pullTodoTasksIntoFile(file, listId, syncAfter, tagSuffix) {
     await this.getValidAccessToken();
     const remoteTasks = await this.graph.listTasks(listId, 200, true);
     const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map((m) => m.graphTaskId));
@@ -503,7 +733,13 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
     const insertAt = this.resolvePullInsertIndex(lines, file);
-    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    let tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    if (tagSuffix && tagForPull) {
+      tagForPull = `${tagForPull}${tagSuffix}`;
+    } else if (tagSuffix) {
+      const base = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : "MicrosoftTodo";
+      tagForPull = `${base}${tagSuffix}`;
+    }
     const insertLines = [];
     const fileMtime = file.stat.mtime;
     let added = 0;
@@ -569,11 +805,17 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     }
     return added;
   }
-  async pullChecklistIntoFile(file, listId) {
+  async pullChecklistIntoFile(file, listId, tagSuffix) {
     await this.getValidAccessToken();
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    const tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    let tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : void 0;
+    if (tagSuffix && tagForPull) {
+      tagForPull = `${tagForPull}${tagSuffix}`;
+    } else if (tagSuffix) {
+      const base = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : "MicrosoftTodo";
+      tagForPull = `${base}${tagSuffix}`;
+    }
     let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
     if (tasks.length === 0) return 0;
     let changed = false;
@@ -600,7 +842,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     for (const parent of parents) {
       const mappingKey = buildMappingKey(file.path, parent.blockId);
       const parentEntry = this.dataModel.taskMappings[mappingKey];
-      if (!parentEntry) continue;
+      if (!parentEntry || parentEntry.listId !== listId) continue;
       let remoteItems;
       try {
         remoteItems = await this.graph.listChecklistItems(parentEntry.listId, parentEntry.graphTaskId);
@@ -701,6 +943,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("No linked files found");
       return;
     }
+    this.updateStatusBar("syncing");
+    await this.fetchTodoLists(false);
     const sorted = [...filePaths].sort((a, b) => a.localeCompare(b));
     let synced = 0;
     let skippedNoList = 0;
@@ -710,20 +954,32 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof import_obsidian.TFile)) continue;
       if (file.extension !== "md") continue;
-      const listId = this.getListIdForFile(file.path);
-      if (!listId) {
+      const listIds = this.getListIdsForFile(file.path);
+      if (listIds.length === 0) {
         skippedNoList++;
         continue;
       }
+      await this.ensureFrontmatterSynced(file, listIds);
       try {
-        pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false);
-        pulledSubtasks += await this.pullChecklistIntoFile(file, listId);
+        const allLists = listIds.length > 1 ? await this.fetchTodoLists(false) : [];
+        const listMap = new Map(allLists.map((l) => [l.id, l.displayName]));
+        for (const listId of listIds) {
+          let suffixTag = void 0;
+          if (listIds.length > 1) {
+            const name = listMap.get(listId) || "List";
+            const safeName = name.replace(/[\s\W]+/g, "-");
+            suffixTag = `-${safeName}`;
+          }
+          pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+          pulledSubtasks += await this.pullChecklistIntoFile(file, listId, suffixTag);
+        }
         await this.syncFileTwoWay(file);
         synced++;
       } catch (error) {
         console.error(error);
       }
     }
+    this.updateStatusBar("idle");
     if (synced === 0) {
       new import_obsidian.Notice(skippedNoList > 0 ? "No files synced (missing list configuration)" : "No files synced");
       return;
@@ -735,11 +991,16 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
   }
   async syncFileTwoWay(file) {
     var _a, _b, _c, _d, _e, _f;
-    const listId = this.getListIdForFile(file.path);
-    if (!listId) {
+    if (this.todoListsCache.length === 0) {
+      await this.fetchTodoLists(false);
+    }
+    const listIds = this.getListIdsForFile(file.path);
+    if (listIds.length === 0) {
       new import_obsidian.Notice("Please select a default list in settings or for the current file");
       return;
     }
+    await this.ensureFrontmatterSynced(file, listIds);
+    const defaultListId = listIds[0];
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
     let tasks = parseMarkdownTasks(lines, this.getPullTagNamesToPreserve());
@@ -846,11 +1107,11 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         const parentMappingKey = buildMappingKey(file.path, parentTask.blockId);
         let parentEntry = this.dataModel.taskMappings[parentMappingKey];
         if (!parentEntry) {
-          const createdParent = await this.graph.createTask(listId, parentTask.title, parentTask.completed, parentTask.dueDate);
+          const createdParent = await this.graph.createTask(defaultListId, parentTask.title, parentTask.completed, parentTask.dueDate);
           const graphHash3 = hashGraphTask(createdParent);
           const localHash3 = hashTask(parentTask.title, parentTask.completed, parentTask.dueDate);
           parentEntry = {
-            listId,
+            listId: defaultListId,
             graphTaskId: createdParent.id,
             lastSyncedAt: Date.now(),
             lastSyncedLocalHash: localHash3,
@@ -974,24 +1235,10 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       const existing = this.dataModel.taskMappings[mappingKey];
       const localHash = hashTask(task.title, task.completed, task.dueDate);
       if (!existing) {
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
+        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
         const graphHash2 = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId,
-          graphTaskId: created.id,
-          lastSyncedAt: Date.now(),
-          lastSyncedLocalHash: localHash,
-          lastSyncedGraphHash: graphHash2,
-          lastSyncedFileMtime: fileMtime,
-          lastKnownGraphLastModified: created.lastModifiedDateTime
-        };
-        continue;
-      }
-      if (existing.listId !== listId) {
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
-        const graphHash2 = hashGraphTask(created);
-        this.dataModel.taskMappings[mappingKey] = {
-          listId,
+          listId: defaultListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1004,10 +1251,10 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       const remote = await this.graph.getTask(existing.listId, existing.graphTaskId);
       if (!remote) {
         delete this.dataModel.taskMappings[mappingKey];
-        const created = await this.graph.createTask(listId, task.title, task.completed, task.dueDate);
+        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
         const graphHash2 = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId,
+          listId: defaultListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1142,9 +1389,32 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     }
     await this.saveDataModel();
   }
-  getListIdForFile(filePath) {
-    var _a;
-    return ((_a = this.dataModel.fileConfigs[filePath]) == null ? void 0 : _a.listId) || this.settings.defaultListId;
+  getListIdsForFile(filePath) {
+    const ids = /* @__PURE__ */ new Set();
+    const config = this.dataModel.fileConfigs[filePath];
+    if ((config == null ? void 0 : config.listIds) && config.listIds.length > 0) {
+      config.listIds.forEach((id) => ids.add(id));
+    }
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (file instanceof import_obsidian.TFile && this.todoListsCache.length > 0) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const fm = cache == null ? void 0 : cache.frontmatter;
+      if (fm) {
+        const raw = fm["microsoft-todo-list"] || fm["mtd-list"];
+        if (raw) {
+          const names = Array.isArray(raw) ? raw : [String(raw)];
+          for (const name of names) {
+            const cleanName = name.trim().toLowerCase();
+            const match = this.todoListsCache.find((l) => l.displayName.toLowerCase() === cleanName);
+            if (match) ids.add(match.id);
+          }
+        }
+      }
+    }
+    if (ids.size === 0) {
+      return this.settings.defaultListId ? [this.settings.defaultListId] : [];
+    }
+    return Array.from(ids);
   }
   getLinkedFilePaths() {
     const paths = /* @__PURE__ */ new Set();
@@ -1158,6 +1428,15 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     };
     addFromMappingKeys(this.dataModel.taskMappings);
     addFromMappingKeys(this.dataModel.checklistMappings);
+    const markdownFiles = this.app.vault.getMarkdownFiles();
+    for (const file of markdownFiles) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const fm = cache == null ? void 0 : cache.frontmatter;
+      if (!fm) continue;
+      if (fm["microsoft-todo-list"] || fm["mtd-list"]) {
+        paths.add(file.path);
+      }
+    }
     return Array.from(paths);
   }
   getActiveMarkdownFile() {
@@ -1312,7 +1591,17 @@ function migrateDataModel(raw) {
   }
   const obj = raw;
   const isRecord = (value) => Boolean(value) && typeof value === "object";
-  const fileConfigs = isRecord(obj.fileConfigs) ? obj.fileConfigs : {};
+  const fileConfigsRaw = isRecord(obj.fileConfigs) ? obj.fileConfigs : {};
+  const fileConfigs = {};
+  for (const [key, val] of Object.entries(fileConfigsRaw)) {
+    if (isRecord(val)) {
+      const existingIds = Array.isArray(val.listIds) ? val.listIds : [];
+      if ("listId" in val && typeof val.listId === "string" && val.listId) {
+        if (!existingIds.includes(val.listId)) existingIds.push(val.listId);
+      }
+      fileConfigs[key] = { listIds: existingIds };
+    }
+  }
   const taskMappings = isRecord(obj.taskMappings) ? obj.taskMappings : {};
   const checklistMappings = isRecord(obj.checklistMappings) ? obj.checklistMappings : {};
   if ("settings" in obj) {
@@ -1340,7 +1629,8 @@ function migrateDataModel(raw) {
       pullHeadingLevel,
       pullInsertLocation,
       pullAppendTagEnabled: typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
-      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag
+      pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag,
+      autoPopulateFrontmatter: typeof settingsRaw.autoPopulateFrontmatter === "boolean" ? settingsRaw.autoPopulateFrontmatter : DEFAULT_SETTINGS.autoPopulateFrontmatter
     };
     return {
       settings: migratedSettings,
@@ -1491,7 +1781,7 @@ function getIndentWidth(indent) {
 function sanitizeTitleForGraph(title) {
   const input = (title || "").trim();
   if (!input) return "";
-  const withoutIds = input.replace(/\^mtdc?_[a-z0-9_]+/gi, " ").replace(/<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*mtdc?_[a-z0-9_]+\s*-->/gi, " ").replace(/\s{2,}/g, " ").trim();
+  const withoutIds = input.replace(/\^mtdc?_[a-z0-9_]+/gi, " ").replace(/<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*-->/gi, " ").replace(/\s{2,}/g, " ").trim();
   return withoutIds;
 }
 function buildMarkdownTaskText(title, dueDate, tag) {
@@ -1770,7 +2060,14 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
       deletion_detach: isZh ? "\u4EC5\u89E3\u9664\u7ED1\u5B9A\uFF08\u4FDD\u7559\u4E91\u7AEF\u4EFB\u52A1\uFF09" : "Detach only (keep remote task)",
       current_file_binding: isZh ? "\u5F53\u524D\u6587\u4EF6\u5217\u8868\u7ED1\u5B9A" : "Current file list binding",
       current_file_binding_desc: isZh ? "\u4E3A\u5F53\u524D\u6D3B\u52A8\u6587\u4EF6\u9009\u62E9\u5217\u8868" : "Select list for active file",
-      clear_sync_state: isZh ? "\u6E05\u9664\u540C\u6B65\u72B6\u6001" : "Clear sync state"
+      clear_sync_state: isZh ? "\u6E05\u9664\u540C\u6B65\u72B6\u6001" : "Clear sync state",
+      auto_populate_frontmatter: isZh ? "\u81EA\u52A8\u586B\u5199\u7B14\u8BB0\u5C5E\u6027" : "Auto-populate frontmatter",
+      auto_populate_frontmatter_desc: isZh ? "\u7ED1\u5B9A\u53D8\u66F4\u65F6\u81EA\u52A8\u66F4\u65B0\u7B14\u8BB0\u5C5E\u6027\uFF0C\u5C5E\u6027\u53D8\u66F4\u65F6\u81EA\u52A8\u66F4\u65B0\u7ED1\u5B9A" : "Update frontmatter on binding change, and update binding on frontmatter change",
+      select_list_tooltip: isZh ? "\u8986\u76D6\u5F53\u524D\u6240\u9009\u5217\u8868" : "Overwrite binding with a new list",
+      add_list: isZh ? "\u8FFD\u52A0\u5217\u8868" : "Add List",
+      add_list_tooltip: isZh ? "\u8FFD\u52A0\u5355\u4E2A\u5217\u8868\u5230\u7ED1\u5B9A\u4E2D" : "Append another list to binding",
+      add_multiple: isZh ? "\u6279\u91CF\u8FFD\u52A0" : "Add Multiple",
+      add_multiple_tooltip: isZh ? "\u6279\u91CF\u9009\u62E9\u5217\u8868\u5E76\u8986\u76D6/\u8BBE\u7F6E\u5F53\u524D\u7ED1\u5B9A" : "Select multiple lists to bind"
     };
     this.t = (key) => {
       var _a;
@@ -1778,6 +2075,7 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
     };
   }
   display() {
+    var _a;
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName(this.t("heading_main")).setHeading();
@@ -1940,15 +2238,59 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveDataModel();
       });
     });
+    new import_obsidian.Setting(containerEl).setName(this.t("auto_populate_frontmatter")).setDesc(this.t("auto_populate_frontmatter_desc")).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.autoPopulateFrontmatter).onChange(async (value) => {
+        this.plugin.settings.autoPopulateFrontmatter = value;
+        await this.plugin.saveDataModel();
+      })
+    );
     new import_obsidian.Setting(containerEl).setName(this.t("current_file_binding")).setDesc(this.t("current_file_binding_desc")).addButton(
-      (btn) => btn.setButtonText(this.t("select_list")).onClick(async () => {
-        await this.plugin.selectListForCurrentFile();
+      (btn) => btn.setButtonText(this.t("select_list")).setTooltip(this.t("select_list_tooltip")).onClick(async () => {
+        await this.plugin.selectListForCurrentFile(false);
+        this.display();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText(`+ ${this.t("add_list")}`).setTooltip(this.t("add_list_tooltip")).onClick(async () => {
+        await this.plugin.selectListForCurrentFile(true);
+        this.display();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText(`+ ${this.t("add_multiple")}`).setTooltip(this.t("add_multiple_tooltip")).onClick(async () => {
+        await this.plugin.addMultipleListsForCurrentFile();
+        this.display();
       })
     ).addButton(
       (btn) => btn.setButtonText(this.t("clear_sync_state")).onClick(async () => {
         await this.plugin.clearSyncStateForCurrentFile();
+        this.display();
       })
     );
+    const activeFile = (_a = this.plugin.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView)) == null ? void 0 : _a.file;
+    if (activeFile) {
+      new import_obsidian.Setting(containerEl).setName(this.t("current_file_info") || "Active File Info").setHeading();
+      const config = this.plugin.dataModel.fileConfigs[activeFile.path];
+      const manualIds = (config == null ? void 0 : config.listIds) || [];
+      let frontmatterRaw = "";
+      const cache = this.plugin.app.metadataCache.getFileCache(activeFile);
+      const fm = cache == null ? void 0 : cache.frontmatter;
+      if (fm) {
+        const raw = fm["microsoft-todo-list"] || fm["mtd-list"];
+        if (raw) {
+          frontmatterRaw = Array.isArray(raw) ? raw.join(", ") : String(raw);
+        }
+      }
+      if (manualIds.length > 0) {
+        const listMap = new Map(this.plugin.todoListsCache.map((l) => [l.id, l.displayName]));
+        const manualNames = manualIds.map((id) => listMap.get(id) || `Unknown ID (${id})`);
+        new import_obsidian.Setting(containerEl).setName("Manually Bound Lists").setDesc("Lists bound via plugin settings").addTextArea((text) => text.setValue(manualNames.join("\n")).setDisabled(true));
+      }
+      if (frontmatterRaw) {
+        new import_obsidian.Setting(containerEl).setName("Frontmatter Binding").setDesc("Lists defined in note properties (microsoft-todo-list)").addText((text) => text.setValue(frontmatterRaw).setDisabled(true));
+      }
+      if (manualIds.length === 0 && !frontmatterRaw) {
+        new import_obsidian.Setting(containerEl).setDesc("No lists bound to this file (will use Default List)");
+      }
+    }
   }
 };
 var main_default = MicrosoftToDoLinkPlugin;
