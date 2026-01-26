@@ -352,6 +352,14 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "sync-linked-files-full",
+      name: "Sync linked files now (push + pull active)",
+      callback: async () => {
+        await this.syncLinkedFilesNow();
+      }
+    });
+
+    this.addCommand({
       id: "select-list-for-current-file",
       name: "Select Microsoft To Do list for current file",
       callback: async () => {
@@ -855,7 +863,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   }
 
   async syncMappedFilesTwoWay() {
-    const filePaths = Object.keys(this.dataModel.fileConfigs);
+    const filePaths = this.getLinkedFilePaths();
     if (filePaths.length === 0) return;
     for (const path of filePaths) {
       const file = this.app.vault.getAbstractFileByPath(path);
@@ -866,6 +874,52 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         console.error(error);
       }
     }
+  }
+
+  async syncLinkedFilesNow() {
+    const filePaths = this.getLinkedFilePaths();
+    if (filePaths.length === 0) {
+      new Notice("No linked files found");
+      return;
+    }
+
+    const sorted = [...filePaths].sort((a, b) => a.localeCompare(b));
+    let synced = 0;
+    let skippedNoList = 0;
+    let pulledTasks = 0;
+    let pulledSubtasks = 0;
+
+    for (const path of sorted) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      if (file.extension !== "md") continue;
+
+      const listId = this.getListIdForFile(file.path);
+      if (!listId) {
+        skippedNoList++;
+        continue;
+      }
+
+      try {
+        pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false);
+        pulledSubtasks += await this.pullChecklistIntoFile(file, listId);
+        await this.syncFileTwoWay(file);
+        synced++;
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    if (synced === 0) {
+      new Notice(skippedNoList > 0 ? "No files synced (missing list configuration)" : "No files synced");
+      return;
+    }
+
+    const pulledTotal = pulledTasks + pulledSubtasks;
+    const pulledPart =
+      pulledTotal > 0 ? `, Pulled: tasks ${pulledTasks}${pulledSubtasks > 0 ? `, subtasks ${pulledSubtasks}` : ""}` : "";
+    const skippedPart = skippedNoList > 0 ? `, Skipped: ${skippedNoList}` : "";
+    new Notice(`Sync completed (Files: ${synced}${skippedPart}${pulledPart})`);
   }
 
   async syncFileTwoWay(file: TFile) {
@@ -1317,6 +1371,25 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
   private getListIdForFile(filePath: string): string {
     return this.dataModel.fileConfigs[filePath]?.listId || this.settings.defaultListId;
+  }
+
+  private getLinkedFilePaths(): string[] {
+    const paths = new Set<string>();
+
+    for (const p of Object.keys(this.dataModel.fileConfigs || {})) paths.add(p);
+
+    const addFromMappingKeys = (obj: Record<string, unknown>) => {
+      for (const key of Object.keys(obj || {})) {
+        const idx = key.indexOf("::");
+        if (idx <= 0) continue;
+        paths.add(key.slice(0, idx));
+      }
+    };
+
+    addFromMappingKeys(this.dataModel.taskMappings);
+    addFromMappingKeys(this.dataModel.checklistMappings);
+
+    return Array.from(paths);
   }
 
   private getActiveMarkdownFile(): TFile | null {
@@ -2003,6 +2076,7 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       sync_now: isZh ? "立即同步" : "Sync now",
       sync_now_desc: isZh ? "完整同步（优先拉取未完成任务）" : "Full sync (pulls incomplete tasks first)",
       sync_current_file: isZh ? "同步当前文件" : "Sync current file",
+      sync_linked_files: isZh ? "同步全部已绑定文件" : "Sync linked files",
       auto_sync: isZh ? "自动同步" : "Auto sync",
       auto_sync_desc: isZh ? "周期性同步已绑定文件" : "Sync mapped files periodically",
       auto_sync_interval: isZh ? "自动同步间隔（分钟）" : "Auto sync interval (minutes)",
@@ -2238,7 +2312,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName(this.t("sync_now"))
       .setDesc(this.t("sync_now_desc"))
-      .addButton(btn => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow()));
+      .addButton(btn => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow()))
+      .addButton(btn => btn.setButtonText(this.t("sync_linked_files")).onClick(async () => await this.plugin.syncLinkedFilesNow()));
 
     new Setting(containerEl)
       .setName(this.t("auto_sync"))

@@ -226,6 +226,13 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
+      id: "sync-linked-files-full",
+      name: "Sync linked files now (push + pull active)",
+      callback: async () => {
+        await this.syncLinkedFilesNow();
+      }
+    });
+    this.addCommand({
       id: "select-list-for-current-file",
       name: "Select Microsoft To Do list for current file",
       callback: async () => {
@@ -676,7 +683,7 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     return added;
   }
   async syncMappedFilesTwoWay() {
-    const filePaths = Object.keys(this.dataModel.fileConfigs);
+    const filePaths = this.getLinkedFilePaths();
     if (filePaths.length === 0) return;
     for (const path of filePaths) {
       const file = this.app.vault.getAbstractFileByPath(path);
@@ -687,6 +694,44 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         console.error(error);
       }
     }
+  }
+  async syncLinkedFilesNow() {
+    const filePaths = this.getLinkedFilePaths();
+    if (filePaths.length === 0) {
+      new import_obsidian.Notice("No linked files found");
+      return;
+    }
+    const sorted = [...filePaths].sort((a, b) => a.localeCompare(b));
+    let synced = 0;
+    let skippedNoList = 0;
+    let pulledTasks = 0;
+    let pulledSubtasks = 0;
+    for (const path of sorted) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof import_obsidian.TFile)) continue;
+      if (file.extension !== "md") continue;
+      const listId = this.getListIdForFile(file.path);
+      if (!listId) {
+        skippedNoList++;
+        continue;
+      }
+      try {
+        pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false);
+        pulledSubtasks += await this.pullChecklistIntoFile(file, listId);
+        await this.syncFileTwoWay(file);
+        synced++;
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    if (synced === 0) {
+      new import_obsidian.Notice(skippedNoList > 0 ? "No files synced (missing list configuration)" : "No files synced");
+      return;
+    }
+    const pulledTotal = pulledTasks + pulledSubtasks;
+    const pulledPart = pulledTotal > 0 ? `, Pulled: tasks ${pulledTasks}${pulledSubtasks > 0 ? `, subtasks ${pulledSubtasks}` : ""}` : "";
+    const skippedPart = skippedNoList > 0 ? `, Skipped: ${skippedNoList}` : "";
+    new import_obsidian.Notice(`Sync completed (Files: ${synced}${skippedPart}${pulledPart})`);
   }
   async syncFileTwoWay(file) {
     var _a, _b, _c, _d, _e, _f;
@@ -1100,6 +1145,20 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
   getListIdForFile(filePath) {
     var _a;
     return ((_a = this.dataModel.fileConfigs[filePath]) == null ? void 0 : _a.listId) || this.settings.defaultListId;
+  }
+  getLinkedFilePaths() {
+    const paths = /* @__PURE__ */ new Set();
+    for (const p of Object.keys(this.dataModel.fileConfigs || {})) paths.add(p);
+    const addFromMappingKeys = (obj) => {
+      for (const key of Object.keys(obj || {})) {
+        const idx = key.indexOf("::");
+        if (idx <= 0) continue;
+        paths.add(key.slice(0, idx));
+      }
+    };
+    addFromMappingKeys(this.dataModel.taskMappings);
+    addFromMappingKeys(this.dataModel.checklistMappings);
+    return Array.from(paths);
   }
   getActiveMarkdownFile() {
     var _a;
@@ -1690,6 +1749,7 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
       sync_now: isZh ? "\u7ACB\u5373\u540C\u6B65" : "Sync now",
       sync_now_desc: isZh ? "\u5B8C\u6574\u540C\u6B65\uFF08\u4F18\u5148\u62C9\u53D6\u672A\u5B8C\u6210\u4EFB\u52A1\uFF09" : "Full sync (pulls incomplete tasks first)",
       sync_current_file: isZh ? "\u540C\u6B65\u5F53\u524D\u6587\u4EF6" : "Sync current file",
+      sync_linked_files: isZh ? "\u540C\u6B65\u5168\u90E8\u5DF2\u7ED1\u5B9A\u6587\u4EF6" : "Sync linked files",
       auto_sync: isZh ? "\u81EA\u52A8\u540C\u6B65" : "Auto sync",
       auto_sync_desc: isZh ? "\u5468\u671F\u6027\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6" : "Sync mapped files periodically",
       auto_sync_interval: isZh ? "\u81EA\u52A8\u540C\u6B65\u95F4\u9694\uFF08\u5206\u949F\uFF09" : "Auto sync interval (minutes)",
@@ -1848,7 +1908,7 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveDataModel();
       })
     );
-    new import_obsidian.Setting(containerEl).setName(this.t("sync_now")).setDesc(this.t("sync_now_desc")).addButton((btn) => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow()));
+    new import_obsidian.Setting(containerEl).setName(this.t("sync_now")).setDesc(this.t("sync_now_desc")).addButton((btn) => btn.setButtonText(this.t("sync_current_file")).onClick(async () => await this.plugin.syncCurrentFileNow())).addButton((btn) => btn.setButtonText(this.t("sync_linked_files")).onClick(async () => await this.plugin.syncLinkedFilesNow()));
     new import_obsidian.Setting(containerEl).setName(this.t("auto_sync")).setDesc(this.t("auto_sync_desc")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async (value) => {
         this.plugin.settings.autoSyncEnabled = value;
