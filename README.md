@@ -4,12 +4,13 @@
 
 ## 特性
 
-- 设备代码登录（Device Code Flow），无需本地回调地址
-- 双向同步：Obsidian ↔ Microsoft To Do（标题 / 完成状态 / 截止日期）
-- 截止日期融合：Obsidian `📅 YYYY-MM-DD` ↔ To Do `dueDateTime`
-- 子任务同步：To Do 的 Steps（checklist items）↔ Obsidian 的嵌套任务
-- 删除策略可配置：从笔记删除任务后，云端可选“标记完成 / 删除 / 仅解绑”
-- 只拉取未完成任务：同步时从 To Do 拉取未完成项到当前文件
+- **设备代码登录**（Device Code Flow），无需本地回调地址，安全方便。
+- **集中同步模式**：所有 Microsoft To Do 列表自动同步到一个中心文件（默认 `MicrosoftTodoTasks.md`），按列表分类展示。
+- **双向同步**：Obsidian ↔ Microsoft To Do（标题 / 完成状态 / 截止日期）。
+- **子任务支持**：To Do 的 Steps（checklist items）↔ Obsidian 的嵌套任务。
+- **Dataview 集成**：自动生成 Dataview 属性（如 `[MTD-任务清单:: 列表名]`），方便查询和管理。
+
+> **注意**：本插件依赖 **Dataview** 插件来有效管理和展示任务元数据，请确保已安装并启用 Dataview。
 
 ## 安装
 
@@ -32,15 +33,11 @@ npm run build
 
 3. 重启 Obsidian 或在设置里禁用/启用插件。
 
-说明：
-- `obsidian-microsoft-todo-link` 来自 [manifest.json](file:///e:/Desktop/share/script/obsidian-MicrosoftToDoLink/manifest.json) 的 `id`，目录名必须一致。
-
 ### 方式 B：开发模式（本地构建）
 
 ```bash
 npm install
 npm run build
-npm run typecheck
 ```
 
 然后将构建后的 `main.js` 与 `manifest.json` 覆盖到 Vault 插件目录。
@@ -92,152 +89,26 @@ App registrations → 你的应用 → API permissions：
 
 ## 使用方式
 
-### 1) 选择同步列表
+### 集中同步（Central Sync）
 
-在插件设置中选择默认列表（或为当前文件选择列表）。文件同步的列表优先级：
+本插件强制使用**集中同步模式**。
 
-1. 当前文件绑定的列表
-2. 默认 Microsoft To Do 列表
+1. 在设置中配置 **中心同步文件路径**（默认为 `MicrosoftTodoTasks.md`）。
+2. 点击左侧 Ribbon 的同步图标（🔄）或使用命令面板执行 `Sync to Central File`。
+3. 插件会自动拉取所有 Microsoft To Do 列表和任务，生成到指定文件中。
+   - 任务会按列表分组（Markdown 标题）。
+   - 包含截止日期 `📅 YYYY-MM-DD`。
+   - 包含 Dataview 属性 `[MTD-任务清单:: 列表名]`。
 
-### 2) 一键同步当前文件（推荐）
+### 修改与回写
 
-点击左侧栏的同步图标，或在设置页点击“同步当前文件”。
-
-同步顺序：
-
-1. 优先从 To Do 拉取未完成任务到当前文件（含子任务/截止日期）
-2. 同步当前文件到 To Do（新建/更新/完成/截止日期）
-3. 云端已完成的任务会回写到 Obsidian 变为 `- [x]`
-
-## 任务格式约定
-
-### Obsidian 任务（会被识别）
-
-```md
-- [ ] 标题 📅 2026-01-17
-```
-
-- `- [ ]` / `- [x]`：未完成/已完成
-- `📅 YYYY-MM-DD`：可选，将同步为 To Do 的截止日期
-
-## 兼容性与依赖
-
-- **不强制依赖 Obsidian Tasks 插件**：本插件只要求任务行是标准 Markdown 任务（`- [ ]` / `- [x]`）。即使你不安装 Tasks 插件，同步也能工作。
-- **关于 `📅 YYYY-MM-DD`**：这是一个“约定格式”。Obsidian 核心不会把它当作字段，默认只把它当作普通文本；但很多任务类插件（尤其是 Obsidian Tasks）会把它识别为 due date，从而支持筛选/排序/查询等“高级任务视图”。
-- **子任务展示**：Obsidian 核心能显示嵌套列表与复选框；如果你依赖“任务查询/聚合视图”，通常也需要配合任务类插件。
-
-### 子任务（Steps / checklist items）
-
-会以嵌套任务的形式展现：
-
-```md
-- [ ] 父任务
-  - [ ] 子任务A
-  - [x] 子任务B
-```
-
-## 同步标识（为什么会有 mtd 标记？能隐藏吗？）
-
-插件需要一个稳定的“本地任务 ↔ 云端任务”映射。为此每条任务会携带一个隐藏标识，形式为 HTML 注释：
-
-```md
-- [ ] 买牛奶 <!-- mtd:mtd_xxxxxxxx -->
-  - [ ] 记得要全脂 <!-- mtd:mtdc_yyyyyyyy -->
-```
-
-- 这类注释在 Obsidian 预览中不会显示
-- 插件会在同步到 To Do 时自动清理这些标识，不会污染 To Do 标题
-
-### 标识隐藏方案（实现细节）
-
-- **为什么必须要有标识**：同步需要稳定地把“某一行任务”绑定到 Graph 的 `taskId` / `checklistItemId`。单靠标题匹配会在改名、同名任务、移动位置时产生误匹配或重复创建。
-- **为什么用 HTML 注释**：`<!-- mtd:... -->` 在 Obsidian 的阅读模式不会显示，同时仍然是纯文本，可被插件稳定解析。
-- **兼容旧格式**：插件会同时识别旧的 `^mtd_...` / `^mtdc_...` 与新的 `<!-- mtd:... -->`；同步时会逐步写回为新格式。
-- **不会污染 To Do 标题**：同步到 Graph 时会自动清洗标题，移除 `^mtd...` 与 `<!-- mtd:... -->`。
-
-## 删除策略
-
-当你在 Obsidian 中删除“已同步过（已建立映射）”的任务行时，插件会按设置的“删除策略”处理云端：
-
-- 标记为已完成（推荐）：To Do 中对应任务/子任务变为 Completed
-- 删除 Microsoft To Do 任务：To Do 中对应任务/子任务被删除
-- 仅解除绑定：不改云端，只移除本地映射
-
-注意：
-- 只有“已建立映射”的任务才会影响云端。未同步过的普通任务不会触发云端删除/完成。
-- **安全保护**：当文件中没有任何任务行但存在大量映射时，会只解除绑定而不改云端，避免误操作。
-
-## 子任务同步规则（Steps / checklist items）
-
-### To Do → Obsidian
-
-- 父任务：写为顶层任务（`- [ ]`）
-- 子任务（Steps）：写为父任务下的嵌套任务（缩进 2 空格）
-- 默认只拉取 **未完成** 的子任务；已完成子任务会以“回写勾选”为主（避免每次同步把历史完成项大量写入笔记）
-
-### Obsidian → To Do
-
-- 在父任务下面新增的嵌套任务会被视为 To Do 的子任务（Steps）
-- 勾选子任务、修改子任务标题会同步到 To Do
-- 为了稳定同步，嵌套任务也会自动拥有自己的 `<!-- mtd:mtdc_... -->` 标识
-
-### 重要约定
-
-- 只有“嵌套在父任务下面”的任务会被当成子任务（Steps）
-- 如果你把一个嵌套任务拖到顶层，它会被当成普通任务同步（或新建为普通任务）
-
-## 风险保护阈值（避免误操作）
-
-为了避免误把大量云端任务标记完成/删除，本插件在“文件中不再包含任何任务行”的场景做了保护：
-
-- 如果该文件没有任何映射：什么都不做
-- 如果该文件存在映射：
-  - 映射数量较少：按“删除策略”同步到云端
-  - 映射数量过大：只解除绑定、不改云端，并提示原因
-
-这个阈值是为了防止：
-
-- 用户误删整段内容/误清空文件
-- 批量编辑导致任务解析失败
+- 在 Obsidian 中修改任务标题、完成状态或截止日期后，再次执行同步，更改将推送回 Microsoft To Do。
+- 只有在这个中心文件中修改且带有同步标记（`<!-- mtd:id -->` 或 `%%mtd:id%%`）的任务才会被同步。
 
 ## 常见问题
 
-### 1) 一直提示登录 / 401 / 400
+- **需要 Dataview 吗？**
+  是的，为了更好的任务分类和元数据管理，建议配合 Dataview 使用。
 
-- 确认已启用 `Allow public client flows`
-- 确认权限已添加：`Tasks.ReadWrite` + `offline_access`
-- 建议 Tenant 填 `common`（个人账号/混合账号场景）
-
-### 2) To Do 里出现了 `^mtd_...` 或类似标识
-
-这是旧版本/异常标题导致的。新版本会在同步时自动清理 To Do 标题中的同步标识。
-
-## 项目结构
-
-```text
-.
-├─ src/
-│  └─ main.ts            插件主逻辑（登录、同步、Graph 调用、设置页）
-├─ manifest.json         Obsidian 插件元信息（id/name/version/author/description）
-├─ esbuild.config.mjs     打包配置
-├─ main.js               构建产物（Obsidian 实际加载）
-├─ package.json
-└─ tsconfig.json
-```
-
-## 实现逻辑概览
-
-- GraphClient：封装 Microsoft Graph 调用（lists/tasks/checklistItems）
-- 解析 Markdown Tasks：识别 `- [ ]` / `- [x]` 与 `📅 YYYY-MM-DD`
-- 拉取策略：默认只拉取未完成任务，已完成任务以“回写勾选”为主
-- 映射存储：
-  - 本地文件行内用 `<!-- mtd:... -->` 保存稳定标识
-  - 插件数据（data.json）保存 blockId ↔ graphId 的映射与 hash，用于增量比较与冲突处理
-
-## 开发
-
-```bash
-npm install
-npm run typecheck
-npm run build
-```
+- **可以同步多个文件吗？**
+  目前仅支持单一中心文件同步，以保持数据一致性和管理简单化。

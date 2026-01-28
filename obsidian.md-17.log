@@ -1,0 +1,10 @@
+eval @ plugin:lazy-plugins:242
+plugin:obsidian-livesync:18 WK-bdb1ef3a11d3d759:2026/1/28 13:08:48->[ModuleDatabaseFileAccess]  STORAGE -> DB (plain) MicrosoftTodoTasks.md
+plugin:microsoft-todo-link:240 [MTD-Debug] Starting syncToCentralFile {path: 'MicrosoftTodoTasks.md', boundListNames: Array(2)}
+plugin:microsoft-todo-link:240 [MTD-Debug] Parsed local tasks {count: 3, tasks: Array(3)}
+plugin:microsoft-todo-link:240 [MTD-Debug] Fetched tasks for list: 🎈 视频任务 {count: 9}
+plugin:microsoft-todo-link:240 [MTD-Debug] Task Comparison [3] {blockId: 'mtd_n5ab9vvm', useLocalState: true, preferLocalByTime: true, graphStale: true, graphChanged: false, …}
+plugin:obsidian-livesync:18 WK-bdb1ef3a11d3d759:2026/1/28 13:08:53->[ModuleDatabaseFileAccess]  STORAGE -> DB (plain) MicrosoftTodoTasks.md
+plugin:microsoft-todo-link:240 [MTD-Debug] Fetched tasks for list: 💡 推文安排 {count: 182}
+plugin:microsoft-todo-link:240 [MTD-Debug] Task Comparison [1] {blockId: 'mtd_sieh8s9g', useLocalState: true, preferLocalByTime: true, graphStale: true, graphChanged: false, …}
+plugin:obsidian-livesync:18 WK-bdb1ef3a11d3d759:2026/1/28 13:08:54->[ModuleDatabaseFileAccess]  STORAGE -> DB (plain) MicrosoftTodoTasks.md

@@ -5,7 +5,7 @@ async function buildContext(watch) {
   const context = await esbuild.context({
     entryPoints: ["src/main.ts"],
     bundle: true,
-    external: ["obsidian"],
+    external: ["obsidian", "@codemirror/view", "@codemirror/state", "@codemirror/language", "@codemirror/commands"],
     format: "cjs",
     target: "es2018",
     platform: "browser",
