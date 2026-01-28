@@ -36,6 +36,7 @@ var DEFAULT_SETTINGS = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
+  autoSyncOnStartup: false,
   centralSyncFilePath: "MicrosoftTodoTasks.md",
   syncHeaderEnabled: true,
   syncHeaderLevel: 2,
@@ -202,50 +203,6 @@ var MultiSelectListModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
-var TagMappingModal = class extends import_obsidian.Modal {
-  constructor(app, plugin, onSubmit) {
-    super(app);
-    __publicField(this, "plugin");
-    __publicField(this, "tagName", "");
-    __publicField(this, "selectedList", null);
-    __publicField(this, "onSubmit");
-    this.plugin = plugin;
-    this.onSubmit = onSubmit;
-  }
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.createEl("h2", { text: this.plugin.t("tag_mapping_modal_title") || "Add Tag Mapping" });
-    new import_obsidian.Setting(contentEl).setName(this.plugin.t("tag_label") || "Tag").setDesc(this.plugin.t("tag_desc") || "Enter the tag (e.g. #Work)").addText((text) => text.setPlaceholder("#Tag").onChange((value) => {
-      this.tagName = value.trim();
-    }));
-    const lists = this.plugin.todoListsCache;
-    new import_obsidian.Setting(contentEl).setName(this.plugin.t("target_list_label") || "Target List").setDesc(this.plugin.t("target_list_desc") || "Select the Microsoft To Do list").addDropdown((dropdown) => {
-      if (lists.length === 0) {
-        dropdown.addOption("", this.plugin.t("no_lists_found") || "No lists found (Try syncing first)");
-      } else {
-        dropdown.addOption("", this.plugin.t("select_list") || "Select a list...");
-        lists.forEach((list) => {
-          dropdown.addOption(list.id, list.displayName);
-        });
-      }
-      dropdown.onChange((value) => {
-        this.selectedList = lists.find((l) => l.id === value) || null;
-      });
-    });
-    new import_obsidian.Setting(contentEl).addButton((btn) => btn.setButtonText(this.plugin.t("add_button") || "Add").setCta().onClick(() => {
-      if (this.tagName && this.selectedList) {
-        this.onSubmit(this.tagName, this.selectedList);
-        this.close();
-      } else {
-        new import_obsidian.Notice(this.plugin.t("enter_tag_list_warning") || "Please enter a tag and select a list.");
-      }
-    }));
-  }
-  onClose() {
-    const { contentEl } = this;
-    contentEl.empty();
-  }
-};
 var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
@@ -305,6 +262,8 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       auto_sync_desc: "\u5468\u671F\u6027\u540C\u6B65\u5DF2\u7ED1\u5B9A\u6587\u4EF6",
       auto_sync_interval: "\u81EA\u52A8\u540C\u6B65\u95F4\u9694\uFF08\u5206\u949F\uFF09",
       auto_sync_interval_desc: "\u81F3\u5C11 1 \u5206\u949F",
+      auto_sync_on_startup: "\u542F\u52A8\u65F6\u81EA\u52A8\u540C\u6B65",
+      auto_sync_on_startup_desc: "Obsidian \u542F\u52A8\u65F6\u81EA\u52A8\u6267\u884C\u4E00\u6B21\u540C\u6B65",
       central_sync_heading: "\u96C6\u4E2D\u540C\u6B65\u6A21\u5F0F",
       central_sync_path: "\u4E2D\u5FC3\u540C\u6B65\u6587\u4EF6\u8DEF\u5F84",
       central_sync_path_desc: "\u76F8\u5BF9\u4E8E Vault \u6839\u76EE\u5F55\u7684\u8DEF\u5F84\uFF08\u4F8B\u5982\uFF1AFolder/MyTasks.md\uFF09",
@@ -347,6 +306,9 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       select_list: "\u9009\u62E9\u4E00\u4E2A\u5217\u8868...",
       add_button: "\u6DFB\u52A0",
       enter_tag_list_warning: "\u8BF7\u8F93\u5165\u6807\u7B7E\u5E76\u9009\u62E9\u5217\u8868\u3002",
+      refresh_lists: "\u5237\u65B0\u5217\u8868",
+      refresh_lists_desc: "\u4ECE Microsoft To Do \u83B7\u53D6\u6700\u65B0\u5217\u8868",
+      tag_binding_desc_bulk: "\u4E3A\u6BCF\u4E2A\u5217\u8868\u8F93\u5165\u6807\u7B7E\uFF08\u9017\u53F7\u5206\u9694\uFF0C\u4F8B\u5982 #Work, #Project\uFF09\u3002\u5E26\u6709\u8FD9\u4E9B\u6807\u7B7E\u7684\u4EFB\u52A1\u5C06\u540C\u6B65\u5230\u5BF9\u5E94\u5217\u8868\u3002",
       manual_full_sync: "\u624B\u52A8\u5168\u91CF\u540C\u6B65",
       manual_full_sync_desc: "\u5F3A\u5236\u8BFB\u53D6\u4E2D\u5FC3\u6587\u4EF6\u5E76\u540C\u6B65\u5230 Graph\uFF08\u7528\u4E8E\u8C03\u8BD5\uFF09",
       sync_now: "\u7ACB\u5373\u540C\u6B65",
@@ -395,6 +357,12 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     this.addSettingTab(new MicrosoftToDoSettingTab(this.app, this));
     this.configureAutoSync();
     this.registerCentralFileAutoPush();
+    if (this.settings.autoSyncOnStartup) {
+      this.app.workspace.onLayoutReady(async () => {
+        new import_obsidian.Notice("Performing startup sync...");
+        await this.syncToCentralFile();
+      });
+    }
   }
   onunload() {
     this.stopAutoSync();
@@ -942,7 +910,7 @@ if (tasks.length) {
           const fmEnd = fileContent.indexOf("---", 3);
           if (fileContent.startsWith("---") && fmEnd > 0) {
             const insertPos = fmEnd + 3;
-            fileContent = fileContent.slice(0, insertPos) + "\n" + appendContent + fileContent.slice(insertPos);
+            fileContent = fileContent.slice(0, insertPos) + "\n\n" + appendContent + fileContent.slice(insertPos);
           } else {
             if (fileContent.trim().length === 0) {
               fileContent = appendContent.trimStart();
@@ -1042,7 +1010,7 @@ ${headerLine}
               if (this.settings.syncDirection === "top") {
                 const fmEnd = centralContent.indexOf("---", 3);
                 if (centralContent.startsWith("---") && fmEnd > 0) {
-                  centralContent = centralContent.slice(0, fmEnd + 3) + "\n" + appendContent + centralContent.slice(fmEnd + 3);
+                  centralContent = centralContent.slice(0, fmEnd + 3) + "\n\n" + appendContent + centralContent.slice(fmEnd + 3);
                 } else {
                   centralContent = appendContent + centralContent;
                 }
@@ -1348,7 +1316,13 @@ ${headerLine}
           const fieldRegex = new RegExp(`\\[${escapeRegExp(fieldName)}\\s*::\\s*.*?\\]`, "gi");
           cleanTitle = cleanTitle.replace(fieldRegex, "").trim();
           cleanTitle = cleanTitle.replace(/\[MTD-任务清单\s*::\s*.*?\]/gi, "").trim();
+          if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
+            const rawTag = escapeRegExp(this.settings.pullAppendTag);
+            const tagRegex = new RegExp(`#${rawTag}(?:/[\\w\\u4e00-\\u9fa5\\-_]+)?`, "gi");
+            cleanTitle = cleanTitle.replace(tagRegex, "").trim();
+          }
           if (!useLocalState && localTask && localTask.blockId === blockId) {
+            cleanTitle = normalizeLocalTitleForSync(cleanTitle);
             const metadataPatterns = [
               /✅\s*\d{4}-\d{2}-\d{2}/,
               // Completion
@@ -1599,6 +1573,7 @@ function migrateDataModel(raw) {
       accessTokenExpiresAt: typeof settingsRaw.accessTokenExpiresAt === "number" ? settingsRaw.accessTokenExpiresAt : DEFAULT_SETTINGS.accessTokenExpiresAt,
       autoSyncEnabled: typeof settingsRaw.autoSyncEnabled === "boolean" ? settingsRaw.autoSyncEnabled : DEFAULT_SETTINGS.autoSyncEnabled,
       autoSyncIntervalMinutes: typeof settingsRaw.autoSyncIntervalMinutes === "number" ? settingsRaw.autoSyncIntervalMinutes : DEFAULT_SETTINGS.autoSyncIntervalMinutes,
+      autoSyncOnStartup: typeof settingsRaw.autoSyncOnStartup === "boolean" ? settingsRaw.autoSyncOnStartup : DEFAULT_SETTINGS.autoSyncOnStartup,
       dataviewFieldName: typeof settingsRaw.dataviewFieldName === "string" ? settingsRaw.dataviewFieldName : DEFAULT_SETTINGS.dataviewFieldName,
       pullAppendTagEnabled: typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
       pullAppendTag: typeof settingsRaw.pullAppendTag === "string" ? settingsRaw.pullAppendTag : DEFAULT_SETTINGS.pullAppendTag,
@@ -2118,44 +2093,46 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     new import_obsidian.Setting(containerEl).setName(this.plugin.t("tag_binding_heading") || "Tag Binding").setHeading();
-    new import_obsidian.Setting(containerEl).setName(this.plugin.t("tag_mappings") || "Tag Mappings").setDesc(this.plugin.t("tag_mappings_desc") || "Map specific tags to Microsoft To Do lists. Tasks with these tags will be synced to the mapped list.").addButton((btn) => btn.setButtonText(this.plugin.t("add_mapping") || "Add Mapping").onClick(async () => {
-      if (this.plugin.todoListsCache.length === 0) {
-        try {
-          const lists = await this.plugin.graph.listTodoLists();
-          this.plugin.todoListsCache = lists;
-        } catch (e) {
-          new import_obsidian.Notice("Failed to fetch lists. Please ensure you are logged in.");
-          return;
-        }
-      }
-      new TagMappingModal(this.app, this.plugin, async (tag, list) => {
-        const normalizedTag = tag.startsWith("#") ? tag : `#${tag}`;
-        this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter((m) => m.tag !== normalizedTag);
-        this.plugin.settings.tagToTaskMappings.push({
-          tag: normalizedTag,
-          listId: list.id,
-          listName: list.displayName
-        });
-        await this.plugin.saveDataModel();
-        new import_obsidian.Notice("Tag mapping added. Scanning files to update tasks...");
-        await this.plugin.scanAndSyncTaggedTasks();
+    new import_obsidian.Setting(containerEl).setName(this.plugin.t("refresh_lists") || "Refresh Lists").setDesc(this.plugin.t("refresh_lists_desc") || "Fetch the latest lists from Microsoft To Do").addButton((btn) => btn.setButtonText(this.plugin.t("refresh") || "Refresh").onClick(async () => {
+      try {
+        new import_obsidian.Notice("Fetching lists...");
+        const lists = await this.plugin.graph.listTodoLists();
+        this.plugin.todoListsCache = lists;
         this.display();
-      }).open();
+        new import_obsidian.Notice("Lists refreshed.");
+      } catch (e) {
+        new import_obsidian.Notice("Failed to fetch lists. Please ensure you are logged in.");
+      }
     }));
-    if (this.plugin.settings.tagToTaskMappings && this.plugin.settings.tagToTaskMappings.length > 0) {
-      new import_obsidian.Setting(containerEl).setName(this.plugin.t("scan_sync_tagged") || "Scan & Sync Tagged Tasks").setDesc(this.plugin.t("scan_sync_tagged_desc") || "Scan all files for tasks with mapped tags. Create new tasks or move existing ones to the correct list.").addButton((btn) => btn.setButtonText(this.plugin.t("scan_now") || "Scan Now").setCta().onClick(async () => {
-        await this.plugin.scanAndSyncTaggedTasks();
-      }));
-      const mappingContainer = containerEl.createDiv();
-      this.plugin.settings.tagToTaskMappings.forEach((mapping, index) => {
-        new import_obsidian.Setting(mappingContainer).setName(mapping.tag).setDesc(`Mapped to: ${mapping.listName}`).addButton((btn) => btn.setIcon("trash").setTooltip("Remove").onClick(async () => {
-          this.plugin.settings.tagToTaskMappings.splice(index, 1);
-          await this.plugin.saveDataModel();
-          new import_obsidian.Notice("Mapping removed. Tasks will retain their current list until modified.");
-          this.display();
-        }));
-      });
+    new import_obsidian.Setting(containerEl).setDesc(this.plugin.t("tag_binding_desc_bulk") || "Enter tags for each list (comma separated, e.g. #Work). Tasks with these tags will be synced to the corresponding list.");
+    if (this.plugin.todoListsCache.length === 0) {
+      new import_obsidian.Setting(containerEl).setName(this.plugin.t("no_lists_found") || "No lists found").setDesc("Please click Refresh to load your lists.");
+    } else {
+      const listsContainer = containerEl.createDiv();
+      const sortedLists = [...this.plugin.todoListsCache].sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
+      for (const list of sortedLists) {
+        const currentTags = this.plugin.settings.tagToTaskMappings.filter((m) => m.listId === list.id).map((m) => m.tag).join(", ");
+        new import_obsidian.Setting(listsContainer).setName(list.displayName).addTextArea(
+          (text) => text.setPlaceholder("#tag1, #tag2").setValue(currentTags).onChange(async (value) => {
+            const newTags = value.split(/[,，]/).map((t) => t.trim()).filter((t) => t.length > 0).map((t) => t.startsWith("#") ? t : `#${t}`);
+            this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter((m) => m.listId !== list.id);
+            const newTagsSet = new Set(newTags);
+            this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter((m) => !newTagsSet.has(m.tag));
+            for (const tag of newTags) {
+              this.plugin.settings.tagToTaskMappings.push({
+                tag,
+                listId: list.id,
+                listName: list.displayName
+              });
+            }
+            await this.plugin.saveDataModel();
+          })
+        );
+      }
     }
+    new import_obsidian.Setting(containerEl).setName(this.plugin.t("scan_sync_tagged") || "Scan & Sync Tagged Tasks").setDesc(this.plugin.t("scan_sync_tagged_desc") || "Scan all files for tasks with mapped tags. Create new tasks or move existing ones to the correct list.").addButton((btn) => btn.setButtonText(this.plugin.t("scan_now") || "Scan Now").setCta().onClick(async () => {
+      await this.plugin.scanAndSyncTaggedTasks();
+    }));
     new import_obsidian.Setting(containerEl).setName(this.plugin.t("auto_sync")).setDesc(this.plugin.t("auto_sync_desc")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async (value) => {
         this.plugin.settings.autoSyncEnabled = value;
@@ -2169,6 +2146,12 @@ var MicrosoftToDoSettingTab = class extends import_obsidian.PluginSettingTab {
         this.plugin.settings.autoSyncIntervalMinutes = Number.isFinite(num) ? Math.max(1, num) : 5;
         await this.plugin.saveDataModel();
         this.plugin.configureAutoSync();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(this.plugin.t("auto_sync_on_startup")).setDesc(this.plugin.t("auto_sync_on_startup_desc")).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.autoSyncOnStartup).onChange(async (value) => {
+        this.plugin.settings.autoSyncOnStartup = value;
+        await this.plugin.saveDataModel();
       })
     );
     new import_obsidian.Setting(containerEl).setName(this.plugin.t("file_binding_heading")).setHeading();

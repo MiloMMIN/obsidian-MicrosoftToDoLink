@@ -67,6 +67,7 @@ interface MicrosoftToDoSettings {
   accessTokenExpiresAt: number;
   autoSyncEnabled: boolean;
   autoSyncIntervalMinutes: number;
+  autoSyncOnStartup: boolean;
   
   // Central Sync Mode
   centralSyncFilePath: string;
@@ -132,6 +133,7 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   accessTokenExpiresAt: 0,
   autoSyncEnabled: false,
   autoSyncIntervalMinutes: 5,
+  autoSyncOnStartup: false,
   centralSyncFilePath: "MicrosoftTodoTasks.md",
   syncHeaderEnabled: true,
   syncHeaderLevel: 2,
@@ -410,69 +412,7 @@ class MultiSelectListModal extends Modal {
 }
 
 
-class TagMappingModal extends Modal {
-    plugin: MicrosoftToDoLinkPlugin;
-    tagName: string = "";
-    selectedList: GraphTodoList | null = null;
-    onSubmit: (tag: string, list: GraphTodoList) => void;
 
-    constructor(app: App, plugin: MicrosoftToDoLinkPlugin, onSubmit: (tag: string, list: GraphTodoList) => void) {
-        super(app);
-        this.plugin = plugin;
-        this.onSubmit = onSubmit;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.createEl("h2", { text: this.plugin.t("tag_mapping_modal_title") || "Add Tag Mapping" });
-
-        new Setting(contentEl)
-            .setName(this.plugin.t("tag_label") || "Tag")
-            .setDesc(this.plugin.t("tag_desc") || "Enter the tag (e.g. #Work)")
-            .addText(text => text
-                .setPlaceholder("#Tag")
-                .onChange(value => {
-                    this.tagName = value.trim();
-                }));
-
-        const lists = this.plugin.todoListsCache;
-        
-        new Setting(contentEl)
-            .setName(this.plugin.t("target_list_label") || "Target List")
-            .setDesc(this.plugin.t("target_list_desc") || "Select the Microsoft To Do list")
-            .addDropdown(dropdown => {
-                if (lists.length === 0) {
-                    dropdown.addOption("", this.plugin.t("no_lists_found") || "No lists found (Try syncing first)");
-                } else {
-                    dropdown.addOption("", this.plugin.t("select_list") || "Select a list...");
-                    lists.forEach(list => {
-                        dropdown.addOption(list.id, list.displayName);
-                    });
-                }
-                dropdown.onChange(value => {
-                    this.selectedList = lists.find(l => l.id === value) || null;
-                });
-            });
-
-        new Setting(contentEl)
-            .addButton(btn => btn
-                .setButtonText(this.plugin.t("add_button") || "Add")
-                .setCta()
-                .onClick(() => {
-                    if (this.tagName && this.selectedList) {
-                        this.onSubmit(this.tagName, this.selectedList);
-                        this.close();
-                    } else {
-                        new Notice(this.plugin.t("enter_tag_list_warning") || "Please enter a tag and select a list.");
-                    }
-                }));
-    }
-
-    onClose() {
-        const { contentEl } = this;
-        contentEl.empty();
-    }
-}
 
 class MicrosoftToDoLinkPlugin extends Plugin {
   dataModel!: PluginDataModel;
@@ -534,6 +474,8 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     auto_sync_desc: "周期性同步已绑定文件",
     auto_sync_interval: "自动同步间隔（分钟）",
     auto_sync_interval_desc: "至少 1 分钟",
+    auto_sync_on_startup: "启动时自动同步",
+    auto_sync_on_startup_desc: "Obsidian 启动时自动执行一次同步",
     central_sync_heading: "集中同步模式",
     central_sync_path: "中心同步文件路径",
     central_sync_path_desc: "相对于 Vault 根目录的路径（例如：Folder/MyTasks.md）",
@@ -577,6 +519,10 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     select_list: "选择一个列表...",
     add_button: "添加",
     enter_tag_list_warning: "请输入标签并选择列表。",
+    
+    refresh_lists: "刷新列表",
+    refresh_lists_desc: "从 Microsoft To Do 获取最新列表",
+    tag_binding_desc_bulk: "为每个列表输入标签（逗号分隔，例如 #Work, #Project）。带有这些标签的任务将同步到对应列表。",
     
     manual_full_sync: "手动全量同步",
     manual_full_sync_desc: "强制读取中心文件并同步到 Graph（用于调试）",
@@ -634,6 +580,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.addSettingTab(new MicrosoftToDoSettingTab(this.app, this));
     this.configureAutoSync();
     this.registerCentralFileAutoPush();
+
+    if (this.settings.autoSyncOnStartup) {
+      this.app.workspace.onLayoutReady(async () => {
+        new Notice("Performing startup sync...");
+        await this.syncToCentralFile();
+      });
+    }
   }
 
   onunload() {
@@ -1366,7 +1319,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
                    if (fileContent.startsWith("---") && fmEnd > 0) {
                         const insertPos = fmEnd + 3;
                         // Insert after frontmatter. 
-                        fileContent = fileContent.slice(0, insertPos) + "\n" + appendContent + fileContent.slice(insertPos);
+                        fileContent = fileContent.slice(0, insertPos) + "\n\n" + appendContent + fileContent.slice(insertPos);
                    } else {
                         // No frontmatter, insert at top.
                         if (fileContent.trim().length === 0) {
@@ -1492,7 +1445,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
                            if (this.settings.syncDirection === "top") {
                                const fmEnd = centralContent.indexOf("---", 3);
                                if (centralContent.startsWith("---") && fmEnd > 0) {
-                                   centralContent = centralContent.slice(0, fmEnd + 3) + "\n" + appendContent + centralContent.slice(fmEnd + 3);
+                                   centralContent = centralContent.slice(0, fmEnd + 3) + "\n\n" + appendContent + centralContent.slice(fmEnd + 3);
                                } else {
                                    centralContent = appendContent + centralContent;
                                }
@@ -1919,8 +1872,17 @@ class MicrosoftToDoLinkPlugin extends Plugin {
             const fieldRegex = new RegExp(`\\[${escapeRegExp(fieldName)}\\s*::\\s*.*?\\]`, "gi");
             cleanTitle = cleanTitle.replace(fieldRegex, "").trim();
             cleanTitle = cleanTitle.replace(/\[MTD-任务清单\s*::\s*.*?\]/gi, "").trim();
+
+            if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
+                 const rawTag = escapeRegExp(this.settings.pullAppendTag);
+                 const tagRegex = new RegExp(`#${rawTag}(?:/[\\w\\u4e00-\\u9fa5\\-_]+)?`, "gi");
+                 cleanTitle = cleanTitle.replace(tagRegex, "").trim();
+            }
             
             if (!useLocalState && localTask && localTask.blockId === blockId) {
+                // Ensure we strip existing metadata from the graph title before appending local metadata
+                cleanTitle = normalizeLocalTitleForSync(cleanTitle);
+
                 const metadataPatterns = [
                     /✅\s*\d{4}-\d{2}-\d{2}/, // Completion
                     /➕\s*\d{4}-\d{2}-\d{2}/, // Created
@@ -2231,6 +2193,7 @@ function migrateDataModel(raw: unknown): PluginDataModel {
         typeof settingsRaw.autoSyncIntervalMinutes === "number"
           ? settingsRaw.autoSyncIntervalMinutes
           : DEFAULT_SETTINGS.autoSyncIntervalMinutes,
+      autoSyncOnStartup: typeof settingsRaw.autoSyncOnStartup === "boolean" ? settingsRaw.autoSyncOnStartup : DEFAULT_SETTINGS.autoSyncOnStartup,
       dataviewFieldName: typeof settingsRaw.dataviewFieldName === "string" ? settingsRaw.dataviewFieldName : DEFAULT_SETTINGS.dataviewFieldName,
       pullAppendTagEnabled:
         typeof settingsRaw.pullAppendTagEnabled === "boolean" ? settingsRaw.pullAppendTagEnabled : DEFAULT_SETTINGS.pullAppendTagEnabled,
@@ -2972,74 +2935,79 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName(this.plugin.t("tag_binding_heading") || "Tag Binding").setHeading();
     new Setting(containerEl)
-        .setName(this.plugin.t("tag_mappings") || "Tag Mappings")
-        .setDesc(this.plugin.t("tag_mappings_desc") || "Map specific tags to Microsoft To Do lists. Tasks with these tags will be synced to the mapped list.")
+        .setName(this.plugin.t("refresh_lists") || "Refresh Lists")
+        .setDesc(this.plugin.t("refresh_lists_desc") || "Fetch the latest lists from Microsoft To Do")
         .addButton(btn => btn
-            .setButtonText(this.plugin.t("add_mapping") || "Add Mapping")
+            .setButtonText(this.plugin.t("refresh") || "Refresh")
             .onClick(async () => {
-                if (this.plugin.todoListsCache.length === 0) {
-                     try {
-                         const lists = await this.plugin.graph.listTodoLists();
-                         this.plugin.todoListsCache = lists;
-                     } catch (e) {
-                         new Notice("Failed to fetch lists. Please ensure you are logged in.");
-                         return;
-                     }
-                }
-                
-                new TagMappingModal(this.app, this.plugin, async (tag, list) => {
-                    const normalizedTag = tag.startsWith("#") ? tag : `#${tag}`;
-                    // Remove existing if duplicate
-                    this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter(m => m.tag !== normalizedTag);
-                    
-                    this.plugin.settings.tagToTaskMappings.push({
-                        tag: normalizedTag,
-                        listId: list.id,
-                        listName: list.displayName
-                    });
-                    await this.plugin.saveDataModel();
-                    
-                    // Trigger global scan/update
-                    new Notice("Tag mapping added. Scanning files to update tasks...");
-                    await this.plugin.scanAndSyncTaggedTasks();
-                    
-                    this.display();
-                }).open();
+                 try {
+                     new Notice("Fetching lists...");
+                     const lists = await this.plugin.graph.listTodoLists();
+                     this.plugin.todoListsCache = lists;
+                     this.display();
+                     new Notice("Lists refreshed.");
+                 } catch (e) {
+                     new Notice("Failed to fetch lists. Please ensure you are logged in.");
+                 }
             }));
 
-    if (this.plugin.settings.tagToTaskMappings && this.plugin.settings.tagToTaskMappings.length > 0) {
-        new Setting(containerEl)
-            .setName(this.plugin.t("scan_sync_tagged") || "Scan & Sync Tagged Tasks")
-            .setDesc(this.plugin.t("scan_sync_tagged_desc") || "Scan all files for tasks with mapped tags. Create new tasks or move existing ones to the correct list.")
-            .addButton(btn => btn
-                .setButtonText(this.plugin.t("scan_now") || "Scan Now")
-                .setCta()
-                .onClick(async () => {
-                    await this.plugin.scanAndSyncTaggedTasks();
-                }));
+    new Setting(containerEl)
+        .setDesc(this.plugin.t("tag_binding_desc_bulk") || "Enter tags for each list (comma separated, e.g. #Work). Tasks with these tags will be synced to the corresponding list.");
 
-        const mappingContainer = containerEl.createDiv();
-        this.plugin.settings.tagToTaskMappings.forEach((mapping, index) => {
-            new Setting(mappingContainer)
-                .setName(mapping.tag)
-                .setDesc(`Mapped to: ${mapping.listName}`)
-                .addButton(btn => btn
-                    .setIcon("trash")
-                    .setTooltip("Remove")
-                    .onClick(async () => {
-                        this.plugin.settings.tagToTaskMappings.splice(index, 1);
+    if (this.plugin.todoListsCache.length === 0) {
+        new Setting(containerEl)
+            .setName(this.plugin.t("no_lists_found") || "No lists found")
+            .setDesc("Please click Refresh to load your lists.");
+    } else {
+        const listsContainer = containerEl.createDiv();
+        
+        const sortedLists = [...this.plugin.todoListsCache].sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""));
+
+        for (const list of sortedLists) {
+             const currentTags = this.plugin.settings.tagToTaskMappings
+                .filter(m => m.listId === list.id)
+                .map(m => m.tag)
+                .join(", ");
+
+             new Setting(listsContainer)
+                .setName(list.displayName)
+                .addTextArea(text => text
+                    .setPlaceholder("#tag1, #tag2")
+                    .setValue(currentTags)
+                    .onChange(async (value) => {
+                        const newTags = value.split(/[,，]/)
+                            .map(t => t.trim())
+                            .filter(t => t.length > 0)
+                            .map(t => t.startsWith("#") ? t : `#${t}`);
+                        
+                        this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter(m => m.listId !== list.id);
+
+                        const newTagsSet = new Set(newTags);
+                        this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter(m => !newTagsSet.has(m.tag));
+
+                        for (const tag of newTags) {
+                            this.plugin.settings.tagToTaskMappings.push({
+                                tag: tag,
+                                listId: list.id,
+                                listName: list.displayName
+                            });
+                        }
+
                         await this.plugin.saveDataModel();
-                        
-                        // Trigger global update? 
-                        // Maybe just removing mapping doesn't need to move tasks back, 
-                        // but adding should definitely trigger.
-                        // But user might want to re-sync.
-                        new Notice("Mapping removed. Tasks will retain their current list until modified.");
-                        
-                        this.display();
-                    }));
-        });
+                    })
+                );
+        }
     }
+
+    new Setting(containerEl)
+        .setName(this.plugin.t("scan_sync_tagged") || "Scan & Sync Tagged Tasks")
+        .setDesc(this.plugin.t("scan_sync_tagged_desc") || "Scan all files for tasks with mapped tags. Create new tasks or move existing ones to the correct list.")
+        .addButton(btn => btn
+            .setButtonText(this.plugin.t("scan_now") || "Scan Now")
+            .setCta()
+            .onClick(async () => {
+                await this.plugin.scanAndSyncTaggedTasks();
+            }));
 
 
     new Setting(containerEl)
@@ -3062,6 +3030,16 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           this.plugin.settings.autoSyncIntervalMinutes = Number.isFinite(num) ? Math.max(1, num) : 5;
           await this.plugin.saveDataModel();
           this.plugin.configureAutoSync();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("auto_sync_on_startup"))
+      .setDesc(this.plugin.t("auto_sync_on_startup_desc"))
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.autoSyncOnStartup).onChange(async value => {
+          this.plugin.settings.autoSyncOnStartup = value;
+          await this.plugin.saveDataModel();
         })
       );
 
