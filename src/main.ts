@@ -84,7 +84,15 @@ interface MicrosoftToDoSettings {
   pullAppendTag: string;
   pullAppendTagType: "tag" | "text";
   appendListToTag: boolean;
+  tagToTaskMappings: { tag: string; listId: string; listName: string }[];
   
+  // Delete options
+  deletionBehavior: "complete" | "delete";
+  
+  // Dataview options
+  dataviewFilterCompleted: boolean;
+  dataviewCompletedMessage: string;
+
   // Debug
   debugLogging: boolean;
 }
@@ -133,6 +141,10 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   pullAppendTag: "MicrosoftTodo",
   pullAppendTagType: "tag",
   appendListToTag: false,
+  tagToTaskMappings: [],
+  deletionBehavior: "complete",
+  dataviewFilterCompleted: false,
+  dataviewCompletedMessage: "🎉 恭喜你完成了所有任务！",
   debugLogging: false
 };
 
@@ -211,6 +223,10 @@ class GraphClient {
     return await this.requestJson<GraphTodoTask>("POST", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks`, body);
   }
 
+  async deleteTask(listId: string, taskId: string): Promise<void> {
+    await this.requestJson<void>("DELETE", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`);
+  }
+
   async updateTask(listId: string, taskId: string, title: string, completed: boolean, dueDate?: string | null): Promise<void> {
     const cleanTitle = this.sanitizeTitleWithSettings(title);
     const patch: Record<string, unknown> = {
@@ -221,6 +237,11 @@ class GraphClient {
       patch.dueDateTime = dueDate === null ? null : buildGraphDueDateTime(dueDate);
     }
     await this.requestJson<void>("PATCH", `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`, patch);
+  }
+
+  async completeTask(listId: string, taskId: string): Promise<void> {
+    const url = `https://graph.microsoft.com/v1.0/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`;
+    await this.requestJson<void>("PATCH", url, { status: "completed" });
   }
 
   private sanitizeTitleWithSettings(title: string): string {
@@ -389,6 +410,70 @@ class MultiSelectListModal extends Modal {
 }
 
 
+class TagMappingModal extends Modal {
+    plugin: MicrosoftToDoLinkPlugin;
+    tagName: string = "";
+    selectedList: GraphTodoList | null = null;
+    onSubmit: (tag: string, list: GraphTodoList) => void;
+
+    constructor(app: App, plugin: MicrosoftToDoLinkPlugin, onSubmit: (tag: string, list: GraphTodoList) => void) {
+        super(app);
+        this.plugin = plugin;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: this.plugin.t("tag_mapping_modal_title") || "Add Tag Mapping" });
+
+        new Setting(contentEl)
+            .setName(this.plugin.t("tag_label") || "Tag")
+            .setDesc(this.plugin.t("tag_desc") || "Enter the tag (e.g. #Work)")
+            .addText(text => text
+                .setPlaceholder("#Tag")
+                .onChange(value => {
+                    this.tagName = value.trim();
+                }));
+
+        const lists = this.plugin.todoListsCache;
+        
+        new Setting(contentEl)
+            .setName(this.plugin.t("target_list_label") || "Target List")
+            .setDesc(this.plugin.t("target_list_desc") || "Select the Microsoft To Do list")
+            .addDropdown(dropdown => {
+                if (lists.length === 0) {
+                    dropdown.addOption("", this.plugin.t("no_lists_found") || "No lists found (Try syncing first)");
+                } else {
+                    dropdown.addOption("", this.plugin.t("select_list") || "Select a list...");
+                    lists.forEach(list => {
+                        dropdown.addOption(list.id, list.displayName);
+                    });
+                }
+                dropdown.onChange(value => {
+                    this.selectedList = lists.find(l => l.id === value) || null;
+                });
+            });
+
+        new Setting(contentEl)
+            .addButton(btn => btn
+                .setButtonText(this.plugin.t("add_button") || "Add")
+                .setCta()
+                .onClick(() => {
+                    if (this.tagName && this.selectedList) {
+                        this.onSubmit(this.tagName, this.selectedList);
+                        this.close();
+                    } else {
+                        new Notice(this.plugin.t("enter_tag_list_warning") || "Please enter a tag and select a list.");
+                    }
+                }));
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
 class MicrosoftToDoLinkPlugin extends Plugin {
   dataModel!: PluginDataModel;
   graph!: GraphClient;
@@ -400,6 +485,110 @@ class MicrosoftToDoLinkPlugin extends Plugin {
   private centralSyncInProgress = false;
   private centralFilePushDebounceId: number | null = null;
   private centralFileAutoPushInProgress = false;
+
+  translations: Record<string, string> = {
+    heading_main: "Microsoft To Do 链接",
+    // Delete options
+    deletion_behavior: "本地删除行为",
+    deletion_behavior_desc: "当在 Obsidian 中删除已同步任务时，如何处理 Microsoft To Do 中的任务",
+    delete_behavior_complete: "标记为完成 (推荐)",
+    delete_behavior_delete: "永久删除",
+    
+    // Dataview options
+    dataview_options: "Dataview 选项",
+    filter_completed: "过滤已完成任务",
+    filter_completed_desc: "在 Dataview 视图中隐藏已完成的任务",
+    completed_message: "完成提示语",
+    completed_message_desc: "当所有任务完成时显示的信息",
+
+    azure_client_id: "Azure 客户端 ID",
+    azure_client_desc: "在 Azure Portal 注册的公共客户端 ID",
+    tenant_id: "租户 ID",
+    tenant_id_desc: "租户 ID（个人账户使用 common）",
+    account_status: "账号状态",
+    logged_in: "已登录",
+    authorized_refresh: "已授权（自动刷新）",
+    not_logged_in: "未登录",
+    device_code: "设备登录代码",
+    device_code_desc: "复制代码并在登录页面中输入",
+    copy_code: "复制代码",
+    open_login_page: "打开登录页面",
+    cannot_open_browser: "无法打开浏览器",
+    copied: "已复制",
+    copy_failed: "复制失败",
+    login_logout: "登录 / 登出",
+    login_logout_desc: "登录将打开浏览器；登出会清除本地令牌",
+    login: "登录",
+    logout: "登出",
+    logged_out: "已登出",
+    login_failed: "登录失败，请查看控制台",
+    append_tag: "拉取时追加标签",
+    append_tag_desc: "为从 Microsoft To Do 拉取的任务追加标签/文本",
+    pull_tag_name: "追加内容",
+    pull_tag_name_desc: "追加到拉取任务末尾",
+    pull_tag_type: "追加格式",
+    pull_tag_type_desc: "选择追加内容的格式",
+    pull_tag_type_tag: "标签（#TagName）",
+    pull_tag_type_text: "纯文本",
+    auto_sync: "自动同步",
+    auto_sync_desc: "周期性同步已绑定文件",
+    auto_sync_interval: "自动同步间隔（分钟）",
+    auto_sync_interval_desc: "至少 1 分钟",
+    central_sync_heading: "集中同步模式",
+    central_sync_path: "中心同步文件路径",
+    central_sync_path_desc: "相对于 Vault 根目录的路径（例如：Folder/MyTasks.md）",
+    file_binding_heading: "文件绑定模式",
+    current_file_binding: "当前文件绑定",
+    not_bound: "未绑定",
+    bound_to: "已绑定到列表：",
+    sync_header: "同步时添加标题",
+    sync_header_desc: "同步时在任务列表前添加 Microsoft To Do 列表名称作为标题",
+    sync_header_level: "标题级别",
+    sync_header_level_desc: "标题的 Markdown 级别 (1-6)",
+    sync_direction: "新内容插入位置",
+    sync_direction_desc: "当文件中没有现有列表时，新内容的插入位置",
+    bound_files_list: "已绑定文件列表",
+    task_options_heading: "任务选项",
+    dataview_field: "Dataview 字段名称（兼容旧块识别）",
+    dataview_field_desc: "用于识别旧 Dataview 块中的字段名称（默认：MTD）",
+    append_list_to_tag: "将列表名追加到标签",
+    append_list_to_tag_desc: "启用后：#标签名/列表名；关闭：#标签名",
+    no_active_file: "没有活动文件",
+    refresh: "刷新",
+    open: "打开",
+    sync_direction_top: "顶部",
+    sync_direction_bottom: "底部",
+    sync_direction_cursor: "光标处（仅当前文件）",
+    
+    // New Tag Binding Translations
+    tag_binding_heading: "标签绑定",
+    tag_mappings: "标签映射",
+    tag_mappings_desc: "将特定标签映射到 Microsoft To Do 列表。带有这些标签的任务将同步到映射的列表。",
+    add_mapping: "添加映射",
+    scan_sync_tagged: "扫描并同步带标签任务",
+    scan_sync_tagged_desc: "扫描所有文件中的带标签任务。创建新任务或将现有任务移动到正确的列表。",
+    scan_now: "立即扫描",
+    tag_mapping_modal_title: "添加标签映射",
+    tag_label: "标签",
+    tag_desc: "输入标签（例如 #Work）",
+    target_list_label: "目标列表",
+    target_list_desc: "选择 Microsoft To Do 列表",
+    no_lists_found: "未找到列表（请先同步）",
+    select_list: "选择一个列表...",
+    add_button: "添加",
+    enter_tag_list_warning: "请输入标签并选择列表。",
+    
+    manual_full_sync: "手动全量同步",
+    manual_full_sync_desc: "强制读取中心文件并同步到 Graph（用于调试）",
+    sync_now: "立即同步",
+    debug_heading: "调试",
+    enable_debug_logging: "启用调试日志",
+    enable_debug_logging_desc: "向开发者控制台输出详细日志 (Ctrl+Shift+I)",
+  };
+
+  t(key: string): string {
+    return this.translations[key] || key;
+  }
 
   async onload() {
     await this.loadDataModel();
@@ -459,6 +648,17 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
   get settings(): MicrosoftToDoSettings {
     return this.dataModel.settings;
+  }
+
+  getTagsToPreserve(): string[] {
+    const tags: string[] = [];
+    if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
+        tags.push(this.settings.pullAppendTag);
+    }
+    if (this.settings.tagToTaskMappings) {
+        tags.push(...this.settings.tagToTaskMappings.map(m => m.tag));
+    }
+    return tags;
   }
 
   async saveDataModel() {
@@ -703,6 +903,130 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     }, minutes * 60 * 1000);
   }
 
+  async scanAndSyncTaggedTasks() {
+      new Notice("Scanning all markdown files for tagged tasks...");
+      const files = this.app.vault.getMarkdownFiles();
+      let totalSynced = 0;
+      let totalMoved = 0;
+
+      // Ensure lists are loaded
+      if (this.todoListsCache.length === 0) {
+          await this.fetchTodoLists(false);
+      }
+      
+      for (const file of files) {
+          const content = await this.app.vault.read(file);
+          const lines = content.split(/\r?\n/);
+          // Parse using ALL configured tags
+          const tasks = parseMarkdownTasks(lines, this.getTagsToPreserve());
+          
+          let modifications: {lineIndex: number, newText: string}[] = [];
+          const mappingPrefix = `${file.path}::`;
+          let fileChanged = false;
+
+          for (const task of tasks) {
+              if (!task.mtdTag) continue; // Skip if no mapped tag
+
+              // Find mapping for this tag
+              const tagMapping = this.settings.tagToTaskMappings?.find(m => m.tag === task.mtdTag);
+              if (!tagMapping) continue; // Tag not mapped
+
+              const targetListId = tagMapping.listId;
+              
+              if (!task.blockId) {
+                  // CASE 1: New Task (Unsynced) -> Create and Inject BlockID
+                  try {
+                      const createdTask = await this.graph.createTask(targetListId, task.title, task.dueDate);
+                      const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
+                      
+                      const mappingKey = `${file.path}::${blockId}`;
+                      const now = Date.now();
+                      const normalizedTitle = normalizeLocalTitleForSync(task.title);
+                      const currentHash = hashTask(normalizedTitle, task.completed, task.dueDate);
+                      
+                      this.dataModel.taskMappings[mappingKey] = {
+                          listId: targetListId,
+                          graphTaskId: createdTask.id,
+                          lastSyncedAt: now,
+                          lastSyncedLocalHash: currentHash,
+                          lastSyncedGraphHash: hashGraphTask(createdTask),
+                          lastSyncedFileMtime: now,
+                          lastKnownGraphLastModified: createdTask.lastModifiedDateTime
+                      };
+
+                      const baseText = `${task.title} ${task.dueDate ? `📅 ${task.dueDate}` : ""} ${task.mtdTag}`.trim();
+                      const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${baseText} ${buildSyncMarker(blockId)}`;
+                      modifications.push({ lineIndex: task.lineIndex, newText: newLine });
+                      totalSynced++;
+                      fileChanged = true;
+                  } catch (e) {
+                      console.error(`Failed to create task ${task.title}`, e);
+                  }
+              } else if (task.blockId.startsWith(BLOCK_ID_PREFIX)) {
+                  // CASE 2: Existing Task -> Check if it needs to move
+                  const mappingKey = `${mappingPrefix}${task.blockId}`;
+                  const currentMapping = this.dataModel.taskMappings[mappingKey];
+                  
+                  if (currentMapping && currentMapping.listId !== targetListId) {
+                      // Needs Move!
+                      this.debug(`Moving task ${task.title} from list ${currentMapping.listId} to ${targetListId}`);
+                      try {
+                          // 1. Delete from old list
+                          try {
+                              await this.graph.deleteTask(currentMapping.listId, currentMapping.graphTaskId);
+                          } catch (e) {
+                              console.warn("Failed to delete old task (might already be gone)", e);
+                          }
+                          
+                          // 2. Create in new list
+                          const createdTask = await this.graph.createTask(targetListId, task.title, task.dueDate);
+                          
+                          // 3. Update Mapping
+                          const now = Date.now();
+                          const normalizedTitle = normalizeLocalTitleForSync(task.title);
+                          const currentHash = hashTask(normalizedTitle, task.completed, task.dueDate);
+                          
+                          this.dataModel.taskMappings[mappingKey] = {
+                              listId: targetListId,
+                              graphTaskId: createdTask.id,
+                              lastSyncedAt: now,
+                              lastSyncedLocalHash: currentHash,
+                              lastSyncedGraphHash: hashGraphTask(createdTask),
+                              lastSyncedFileMtime: now,
+                              lastKnownGraphLastModified: createdTask.lastModifiedDateTime
+                          };
+                          
+                          // 4. Update line?
+                          // We don't strictly need to update the line if the content hasn't changed, 
+                          // but we might want to ensure the tag is preserved/clean.
+                          // Let's leave the line alone if only the list changed, unless we want to enforce formatting.
+                          totalMoved++;
+                          fileChanged = true;
+                      } catch (e) {
+                          console.error(`Failed to move task ${task.title}`, e);
+                      }
+                  }
+              }
+          }
+
+          if (modifications.length > 0) {
+              // Apply edits
+              const newLines = [...lines];
+              const updates = new Map(modifications.map(m => [m.lineIndex, m.newText]));
+              for (const [idx, text] of updates) {
+                  newLines[idx] = text;
+              }
+              await this.app.vault.modify(file, newLines.join("\n"));
+          }
+          
+          if (fileChanged) {
+              await this.saveDataModel();
+          }
+      }
+      
+      new Notice(`Scan complete: ${totalSynced} new tasks synced, ${totalMoved} tasks moved.`);
+  }
+
   async syncAllBoundFiles() {
       const files = this.app.vault.getMarkdownFiles();
       for (const file of files) {
@@ -865,12 +1189,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           
           // Regex to match: Optional Header -> Dataview Block -> WHERE ...
           // We match both sanitized and raw field names AND new meta(section) queries
+          // Modified to be more permissive about what follows the WHERE clause (e.g. AND !completed)
           const genericBlockRegex = new RegExp(
             `((?:^|\\n)#{1,6}\\s+.*?\\n)?` + 
             `\`\`\`dataview\\s*\\n` +
             `TASK\\s*\\n` +
             `FROM\\s+".*?"\\s*\\n` +
-            `WHERE\\s+(?:contains\\((?:MTD-任务清单|${escapedRawField}|${escapedField}),\\s+"(.*?)"\\)|meta\\(section\\)\\.subpath\\s*=\\s*"(.*?)"|contains\\(string\\(section\\),\\s*"(.*?)"\\))\\s*\\n` +
+            `WHERE\\s+(?:contains\\((?:MTD-任务清单|${escapedRawField}|${escapedField}),\\s+"(.*?)"\\)|meta\\(section\\)\\.subpath\\s*=\\s*"(.*?)"|contains\\(string\\(section\\),\\s*"(.*?)"\\)).*?(?:\\n|\\s*)` +
             `\`\`\``,
             "g"
           );
@@ -902,6 +1227,38 @@ class MicrosoftToDoLinkPlugin extends Plugin {
                }
           }
 
+          // Also find DataviewJS blocks generated by this plugin
+          const dataviewJsBlockRegex = new RegExp(
+            `((?:^|\\n)#{1,6}\\s+.*?\\n)?` + 
+            `\`\`\`dataviewjs\\s*\\n` +
+            `const tasks = dv\\.page\\(".*?"\\)\\.file\\.tasks\\s*\\n` +
+            `\\s*\\.where\\(t => t\\.section\\.subpath === "(.*?)"[\\s\\S]*?` + 
+            `\`\`\``,
+            "g"
+          );
+
+          let jsMatch;
+          while ((jsMatch = dataviewJsBlockRegex.exec(fileContent)) !== null) {
+             const foundListName = jsMatch[2];
+             if (!foundListName) continue;
+
+             let covered = false;
+             for (const leg of legacyBlocks.values()) {
+                 if (jsMatch.index >= leg.start && jsMatch.index < leg.end) {
+                     covered = true;
+                     break;
+                 }
+             }
+             if (!covered) {
+                 // Register dataviewjs block so it can be replaced/updated
+                 genericBlocks.set(foundListName, {
+                     start: jsMatch.index,
+                     end: jsMatch.index + jsMatch[0].length,
+                     content: jsMatch[0]
+                 });
+             }
+          }
+
           // Refactored Logic for Modifications & Appends
           const listsToAppend: string[] = [];
           const finalModifications: {start: number, end: number, replacement: string}[] = [];
@@ -930,14 +1287,59 @@ class MicrosoftToDoLinkPlugin extends Plugin {
                // Use meta(section).subpath to find tasks under the header, 
                // since we no longer use inline fields.
                // Note: 'section' is a link to the header. meta(section).subpath gives the header text.
+               const filterSuffix = this.settings.dataviewFilterCompleted 
+                  ? " AND !completed" 
+                  : "";
+               
                const dataviewBlock = 
                   "```dataview\n" +
                   "TASK\n" +
                   `FROM "${centralPath}"\n` +
-                  `WHERE meta(section).subpath = "${listName}"\n` +
+                  `WHERE meta(section).subpath = "${listName}"${filterSuffix}\n` +
                   "```";
                
-               const newContent = header + dataviewBlock + "\n";
+               const emptyMessage = this.settings.dataviewFilterCompleted && this.settings.dataviewCompletedMessage
+                  ? `\n> [!success] ${this.settings.dataviewCompletedMessage}\n> \n` // Using callout for nicer look? Or just text.
+                  : "";
+               
+               // Actually, Dataview doesn't show "congrats" message natively if empty.
+               // We can use DataviewJS for that, but that's complex.
+               // Or we can just let it be empty.
+               // User wants: "如果全部任务已经完成，可以留一个“🎉恭喜你完成了所有任务！”"
+               // This implies we need to check if there are tasks.
+               // Simple Dataview query block doesn't support "else".
+               // We might need to switch to dataviewjs? 
+               // Or we can use a hack: 
+               // Check if there are incomplete tasks in Central File?
+               // But that requires reading Central File here.
+               // For now, let's just stick to the query. 
+               // If user wants custom message, maybe we can't easily do it with pure Dataview query block if result is empty.
+               // Wait, user said "Dataview映射的时候是否过滤已完成task".
+               // If filtered, and result is empty -> show message.
+               
+               // Let's implement DataviewJS block for better control?
+               // "dv.taskList(dv.pages('...').file.tasks.where(...))"
+               // If empty, dv.paragraph("...")
+               
+               // Let's use DataviewJS if filter enabled.
+               
+               let blockContent = "";
+               if (this.settings.dataviewFilterCompleted) {
+                   blockContent = 
+                       "```dataviewjs\n" +
+                       `const tasks = dv.page("${centralPath}").file.tasks\n` +
+                       `  .where(t => t.section.subpath === "${listName}" && !t.completed);\n` +
+                       "if (tasks.length) {\n" +
+                       "  dv.taskList(tasks);\n" +
+                       "} else {\n" +
+                       `  dv.paragraph("${this.settings.dataviewCompletedMessage}");\n` +
+                       "}\n" +
+                       "```";
+               } else {
+                   blockContent = dataviewBlock;
+               }
+               
+               const newContent = header + blockContent + "\n";
 
                if (legacyBlocks.has(listName)) {
                    const info = legacyBlocks.get(listName)!;
@@ -1021,7 +1423,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           const content = await this.app.vault.read(file);
           const lines = content.split(/\r?\n/);
           // Note: parseMarkdownTasks is a standalone function
-          const tasks = parseMarkdownTasks(lines, this.settings.pullAppendTagEnabled ? [this.settings.pullAppendTag] : []);
+          const tasks = parseMarkdownTasks(lines, this.getTagsToPreserve());
           
           const newTasks = tasks.filter(t => !t.blockId);
           if (newTasks.length === 0) continue;
@@ -1029,44 +1431,218 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           // Get bound list(s)
           const cache = this.app.metadataCache.getFileCache(file);
           const binding = cache?.frontmatter?.["microsoft-todo-list"];
-          let targetListName = "";
+          let defaultListName = "";
           if (typeof binding === "string") {
-              targetListName = binding;
+              defaultListName = binding;
           } else if (Array.isArray(binding) && binding.length > 0) {
-              targetListName = binding[0]; // Default to first list
+              defaultListName = binding[0]; // Default to first list
           }
 
-          if (!targetListName) continue;
-          const list = listsByName.get(targetListName);
-          if (!list) continue;
+          if (!defaultListName) continue;
+          const defaultList = listsByName.get(defaultListName);
+          if (!defaultList) continue;
 
-          this.debug(`Found ${newTasks.length} new tasks in bound file ${file.basename}, uploading to ${targetListName}`);
+          this.debug(`Found ${newTasks.length} new tasks in bound file ${file.basename}`);
 
           // Upload tasks
-          let modifications: {lineIndex: number}[] = [];
+          let modifications: {lineIndex: number, newText: string}[] = [];
+          let removals: {lineIndex: number}[] = [];
+          
+          // Ensure central file exists
+          let centralFile = this.app.vault.getAbstractFileByPath(this.settings.centralSyncFilePath);
+          if (!centralFile && this.settings.centralSyncFilePath) {
+              try {
+                   const path = this.settings.centralSyncFilePath;
+                   const folderPath = path.substring(0, path.lastIndexOf("/"));
+                   if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
+                       await this.app.vault.createFolder(folderPath);
+                   }
+                   centralFile = await this.app.vault.create(path, "");
+              } catch(e) { console.error("Failed to create central file", e); }
+          }
           
           for (const task of newTasks) {
-              try {
-                  await this.graph.createTask(list.id, task.title, task.dueDate);
-                  modifications.push({ lineIndex: task.lineIndex });
-              } catch (e) {
-                  console.error(`Failed to create task ${task.title}`, e);
+              let targetListId = defaultList.id;
+              let targetListName = defaultList.displayName;
+              let isTagMapped = false;
+              
+              // Check for tag mappings
+              if (task.mtdTag && this.settings.tagToTaskMappings) {
+                   const cleanTag = task.mtdTag;
+                   const mapping = this.settings.tagToTaskMappings.find(m => m.tag === cleanTag);
+                   if (mapping) {
+                       targetListId = mapping.listId;
+                       targetListName = mapping.listName;
+                       isTagMapped = true;
+                       this.debug(`Redirecting task "${task.title}" to list "${mapping.listName}" due to tag ${cleanTag}`);
+                   }
+              }
+
+              // Instead of creating directly on Graph, we append to Central File
+              if (centralFile instanceof TFile) {
+                   // 1. Append to Central File under correct header
+                   try {
+                       let centralContent = await this.app.vault.read(centralFile);
+                       const headerLine = `## ${targetListName}`;
+                       
+                       // Check if header exists
+                       if (!centralContent.includes(headerLine)) {
+                           // Add header
+                           const appendContent = `\n${headerLine}\n`;
+                           if (this.settings.syncDirection === "top") {
+                               const fmEnd = centralContent.indexOf("---", 3);
+                               if (centralContent.startsWith("---") && fmEnd > 0) {
+                                   centralContent = centralContent.slice(0, fmEnd + 3) + "\n" + appendContent + centralContent.slice(fmEnd + 3);
+                               } else {
+                                   centralContent = appendContent + centralContent;
+                               }
+                           } else {
+                               centralContent = centralContent.trimEnd() + "\n\n" + appendContent;
+                           }
+                       }
+                       
+                       // Append task under header
+                       // We need to find the header again as content might have changed
+                       const lines = centralContent.split(/\r?\n/);
+                       const headerIndex = lines.findIndex(l => l.trim() === headerLine);
+                       
+                       if (headerIndex >= 0) {
+                           // Insert after header
+                           // We need to inject the tag if it's not tag mapped? No, we should strip the tag if we want clean sync.
+                           // But if we want it to be syncable from Central File, it should look like a normal task.
+                           // The Central File Sync logic will pick it up and upload to Graph.
+                           
+                           const cleanTitle = task.title; // Keep title as is (maybe strip tag?)
+                           // Actually, Central File Sync logic uses `heading` to determine list.
+                           // So we just need to put it under the header.
+                           
+                           // If tag mapped, we might want to strip the tag so it doesn't duplicate in To Do?
+                           // Yes, `parseMarkdownTasks` extracts tags.
+                           // But `syncToCentralFile` uploads based on `heading`.
+                           
+                           const lineToAdd = `- [ ] ${cleanTitle} ${task.dueDate ? `📅 ${task.dueDate}` : ""}`;
+                           lines.splice(headerIndex + 1, 0, lineToAdd);
+                           
+                           await this.app.vault.modify(centralFile, lines.join("\n"));
+                           
+                           // Now we replace local task with Dataview or delete it
+                           if (isTagMapped) {
+                               // Tag mapped tasks are typically scattered. 
+                               // User wants them "moved" to Central File but maybe keep a view?
+                               // "你直接在ob给我吃掉了" -> implies they disappeared.
+                               // "应该是把task直接从各个散落文件移到中心文件统一管理才对"
+                               // So user EXPECTS them to be removed from local and appear in Central.
+                               
+                               // If we replace with Dataview query, they "appear" to be there but are actually in Central.
+                               // But user said "moved to central file".
+                               // If we just delete locally, they are gone from local file.
+                               // If user wants to "manage" them in Central, then deleting locally is correct.
+                               
+                               // BUT, if the file is bound, maybe they want to see it?
+                               // If it's a bound file, we usually replace with Dataview.
+                               
+                               // Let's stick to: Move to Central, Remove from Local.
+                               removals.push({ lineIndex: task.lineIndex });
+                           } else {
+                               // Standard binding -> Remove locally (Dataview will show it)
+                               removals.push({ lineIndex: task.lineIndex });
+                           }
+                           
+                           new Notice(`Moved task "${task.title}" to Central File under "${targetListName}"`);
+                       }
+                   } catch (e) {
+                       console.error("Failed to move to central file", e);
+                   }
+              } else {
+                  // Fallback if no central file (should not happen if configured)
+                  new Notice("Central Sync File not found. Cannot move task.");
               }
           }
 
-          // Remove uploaded tasks from file
-          // Sort modifications by lineIndex desc to avoid shifting
-          modifications.sort((a, b) => b.lineIndex - a.lineIndex);
-          
+          // Apply modifications (In-Place Updates)
           if (modifications.length > 0) {
               const newFileLines = [...lines];
-              for (const mod of modifications) {
-                  newFileLines.splice(mod.lineIndex, 1);
+              // Sort by lineIndex desc? Actually array index access is constant time if we don't splice yet.
+              // But if we mix removals and updates...
+              // Let's apply updates first? No, removals shift indices.
+              // We should batch all ops.
+          }
+          
+          // Let's rebuild the file content cleanly.
+          // We have a list of indices to REMOVE and indices to REPLACE.
+          // Create a set of removed indices for O(1) lookup
+          const removedIndices = new Set(removals.map(r => r.lineIndex));
+          const updates = new Map(modifications.map(m => [m.lineIndex, m.newText]));
+          
+          const finalLines: string[] = [];
+          for (let i = 0; i < lines.length; i++) {
+              if (removedIndices.has(i)) continue;
+              if (updates.has(i)) {
+                  finalLines.push(updates.get(i)!);
+              } else {
+                  finalLines.push(lines[i]);
               }
-              await this.app.vault.modify(file, newFileLines.join("\n"));
-              new Notice(`Uploaded ${modifications.length} new tasks from ${file.basename}`);
+          }
+          
+          if (modifications.length > 0 || removals.length > 0) {
+              await this.app.vault.modify(file, finalLines.join("\n"));
+              // Trigger Central Sync to actually upload to Graph
+              this.syncToCentralFile();
           }
       }
+  }
+
+  async completeTask(listId: string, taskId: string): Promise<void> {
+      await this.graph.completeTask(listId, taskId);
+  }
+
+  // Deletion logic when syncing from Central File
+  // Currently we only push UPDATES. 
+  // We need to handle deletions.
+  // If a task is removed from Central File (or local bound file block), it implies user deleted it.
+  // But our logic is mostly "Push Local Changes".
+  // If we delete a line in Obsidian, `parseMarkdownTasks` won't find it.
+  // So we need to compare `this.dataModel.taskMappings` with `parsedTasks`.
+  
+  // We need to implement `processDeletions` method.
+  
+  private async processDeletions(file: TFile, currentBlockIds: Set<string>) {
+       const mappingPrefix = `${file.path}::`;
+       const keysToDelete: string[] = [];
+       
+       for (const key of Object.keys(this.dataModel.taskMappings)) {
+           if (key.startsWith(mappingPrefix)) {
+               const blockId = key.slice(mappingPrefix.length);
+               // If mapped task is NOT in current parsed tasks -> It was deleted locally
+               if (!currentBlockIds.has(blockId)) {
+                   const mapping = this.dataModel.taskMappings[key];
+                   // Perform deletion on Graph based on settings
+                   try {
+                       if (this.settings.deletionBehavior === "delete") {
+                           await this.graph.deleteTask(mapping.listId, mapping.graphTaskId);
+                           this.debug(`Deleted task on Graph: ${mapping.graphTaskId}`);
+                       } else {
+                           // Default: Complete it
+                           // Use completeTask helper
+                           await this.completeTask(mapping.listId, mapping.graphTaskId);
+                           this.debug(`Completed task on Graph: ${mapping.graphTaskId}`);
+                       }
+                   } catch (e) {
+                       console.warn(`Failed to process deletion for ${blockId}`, e);
+                   }
+                   keysToDelete.push(key);
+               }
+           }
+       }
+       
+       for (const key of keysToDelete) {
+           delete this.dataModel.taskMappings[key];
+       }
+       
+       if (keysToDelete.length > 0) {
+           await this.saveDataModel();
+           new Notice(`Processed ${keysToDelete.length} deletions`);
+       }
   }
 
   async syncToCentralFile() {
@@ -1135,11 +1711,18 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       // 1. Read and parse local file first to detect local changes
       const fileContent = await this.app.vault.read(file);
       const fileLines = fileContent.split(/\r?\n/);
-      const parsedTasks = parseMarkdownTasks(fileLines, this.settings.pullAppendTagEnabled ? [this.settings.pullAppendTag] : []);
-      this.debug("Parsed local tasks", { 
+      const parsedTasks = parseMarkdownTasks(fileLines, this.getTagsToPreserve());
+      this.debug("Parsed local tasks", {  
           count: parsedTasks.length,
           tasks: parsedTasks.map(t => ({ id: t.blockId, title: t.title, completed: t.completed }))
       });
+
+      // Detect and Process Deletions
+      const currentBlockIds = new Set<string>();
+      for (const t of parsedTasks) {
+          if (t.blockId) currentBlockIds.add(t.blockId);
+      }
+      await this.processDeletions(file, currentBlockIds);
 
       await this.pushLocalChangesWithParsedTasks(file, parsedTasks, allowedListIds);
       
@@ -1148,18 +1731,25 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (newCentralTasks.length > 0) {
           this.debug(`Found ${newCentralTasks.length} new tasks in Central File, uploading...`);
           for (const task of newCentralTasks) {
-              if (task.heading) {
-                  // The heading might contain hashtags, need to strip them if listsByName keys don't have them?
-                  // listsByName keys are displayName from Graph.
-                  // Heading from parser is "# ListName" -> "ListName".
-                  // So it should match.
+              let targetListId = null;
+
+              // Check tags first
+              if (task.mtdTag && this.settings.tagToTaskMappings) {
+                   const mapping = this.settings.tagToTaskMappings.find(m => m.tag === task.mtdTag);
+                   if (mapping) targetListId = mapping.listId;
+              }
+
+              // Fallback to heading
+              if (!targetListId && task.heading) {
                   const list = listsByName.get(task.heading);
-                  if (list) {
-                      try {
-                          await this.graph.createTask(list.id, task.title, task.dueDate);
-                      } catch (e) {
-                          console.error(`Failed to upload new task ${task.title}`, e);
-                      }
+                  if (list) targetListId = list.id;
+              }
+
+              if (targetListId) {
+                  try {
+                      await this.graph.createTask(targetListId, task.title, task.dueDate);
+                  } catch (e) {
+                      console.error(`Failed to upload new task ${task.title}`, e);
                   }
               }
           }
@@ -1298,7 +1888,20 @@ class MicrosoftToDoLinkPlugin extends Plugin {
             const fieldName = (this.settings.dataviewFieldName || "MTD").replace(/^#+/, "");
             
             let tag = "";
-            if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
+            let mappedTag = "";
+            
+            // Check if this list is mapped to a specific tag
+            if (this.settings.tagToTaskMappings) {
+                 const mapping = this.settings.tagToTaskMappings.find(m => m.listId === list.id);
+                 if (mapping) {
+                     mappedTag = mapping.tag;
+                 }
+            }
+
+            if (mappedTag) {
+                // If mapped, use the mapped tag and DO NOT append list name or default tag
+                tag = mappedTag;
+            } else if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
                  const rawTag = this.settings.pullAppendTag;
                  const prefix = this.settings.pullAppendTagType === "tag" ? "#" : "";
                  
@@ -1500,7 +2103,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       // Use standard read to avoid excessive caching delays during auto-push
       const content = await this.app.vault.read(file);
       const lines = content.split(/\r?\n/);
-      const tasks = parseMarkdownTasks(lines, this.settings.pullAppendTagEnabled ? [this.settings.pullAppendTag] : []);
+      const tasks = parseMarkdownTasks(lines, this.getTagsToPreserve());
       await this.pushLocalChangesWithParsedTasks(file, tasks, allowedListIds);
   }
 
@@ -1637,6 +2240,10 @@ function migrateDataModel(raw: unknown): PluginDataModel {
           ? settingsRaw.pullAppendTagType
           : DEFAULT_SETTINGS.pullAppendTagType,
       appendListToTag: typeof settingsRaw.appendListToTag === "boolean" ? settingsRaw.appendListToTag : DEFAULT_SETTINGS.appendListToTag,
+      tagToTaskMappings: Array.isArray(settingsRaw.tagToTaskMappings) ? settingsRaw.tagToTaskMappings : DEFAULT_SETTINGS.tagToTaskMappings,
+      deletionBehavior: settingsRaw.deletionBehavior === "delete" ? "delete" : "complete",
+      dataviewFilterCompleted: typeof settingsRaw.dataviewFilterCompleted === "boolean" ? settingsRaw.dataviewFilterCompleted : DEFAULT_SETTINGS.dataviewFilterCompleted,
+      dataviewCompletedMessage: typeof settingsRaw.dataviewCompletedMessage === "string" ? settingsRaw.dataviewCompletedMessage : DEFAULT_SETTINGS.dataviewCompletedMessage,
       centralSyncFilePath: typeof settingsRaw.centralSyncFilePath === "string" ? settingsRaw.centralSyncFilePath : DEFAULT_SETTINGS.centralSyncFilePath,
       syncHeaderEnabled: typeof settingsRaw.syncHeaderEnabled === "boolean" ? settingsRaw.syncHeaderEnabled : DEFAULT_SETTINGS.syncHeaderEnabled,
       syncHeaderLevel: typeof settingsRaw.syncHeaderLevel === "number" ? settingsRaw.syncHeaderLevel : DEFAULT_SETTINGS.syncHeaderLevel,
@@ -2136,84 +2743,21 @@ async function requestUrlNoThrow(params: RequestUrlParam): Promise<{
 
 class MicrosoftToDoSettingTab extends PluginSettingTab {
   plugin: MicrosoftToDoLinkPlugin;
-  private t: (key: string) => string;
 
   constructor(app: App, plugin: MicrosoftToDoLinkPlugin) {
     super(app, plugin);
     this.plugin = plugin;
-    const dict: Record<string, string> = {
-      heading_main: "Microsoft To Do 链接",
-      azure_client_id: "Azure 客户端 ID",
-      azure_client_desc: "在 Azure Portal 注册的公共客户端 ID",
-      tenant_id: "租户 ID",
-      tenant_id_desc: "租户 ID（个人账户使用 common）",
-      account_status: "账号状态",
-      logged_in: "已登录",
-      authorized_refresh: "已授权（自动刷新）",
-      not_logged_in: "未登录",
-      device_code: "设备登录代码",
-      device_code_desc: "复制代码并在登录页面中输入",
-      copy_code: "复制代码",
-      open_login_page: "打开登录页面",
-      cannot_open_browser: "无法打开浏览器",
-      copied: "已复制",
-      copy_failed: "复制失败",
-      login_logout: "登录 / 登出",
-      login_logout_desc: "登录将打开浏览器；登出会清除本地令牌",
-      login: "登录",
-      logout: "登出",
-      logged_out: "已登出",
-      login_failed: "登录失败，请查看控制台",
-      append_tag: "拉取时追加标签",
-      append_tag_desc: "为从 Microsoft To Do 拉取的任务追加标签/文本",
-      pull_tag_name: "追加内容",
-      pull_tag_name_desc: "追加到拉取任务末尾",
-      pull_tag_type: "追加格式",
-      pull_tag_type_desc: "选择追加内容的格式",
-      pull_tag_type_tag: "标签（#TagName）",
-      pull_tag_type_text: "纯文本",
-      auto_sync: "自动同步",
-      auto_sync_desc: "周期性同步已绑定文件",
-      auto_sync_interval: "自动同步间隔（分钟）",
-      auto_sync_interval_desc: "至少 1 分钟",
-      central_sync_heading: "集中同步模式",
-      central_sync_path: "中心同步文件路径",
-      central_sync_path_desc: "相对于 Vault 根目录的路径（例如：Folder/MyTasks.md）",
-      file_binding_heading: "文件绑定模式",
-      current_file_binding: "当前文件绑定",
-      not_bound: "未绑定",
-      bound_to: "已绑定到列表：",
-      sync_header: "同步时添加标题",
-      sync_header_desc: "同步时在任务列表前添加 Microsoft To Do 列表名称作为标题",
-      sync_header_level: "标题级别",
-      sync_header_level_desc: "标题的 Markdown 级别 (1-6)",
-      sync_direction: "新内容插入位置",
-      sync_direction_desc: "当文件中没有现有列表时，新内容的插入位置",
-      bound_files_list: "已绑定文件列表",
-      task_options_heading: "任务选项",
-      dataview_field: "Dataview 字段名称（兼容旧块识别）",
-      dataview_field_desc: "用于识别旧 Dataview 块中的字段名称（默认：MTD）",
-      append_list_to_tag: "将列表名追加到标签",
-      append_list_to_tag_desc: "启用后：#标签名/列表名；关闭：#标签名",
-      no_active_file: "没有活动文件",
-      refresh: "刷新",
-      open: "打开",
-      sync_direction_top: "顶部",
-      sync_direction_bottom: "底部",
-      sync_direction_cursor: "光标处（仅当前文件）",
-    };
-    this.t = (key: string) => dict[key] ?? key;
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     
-    new Setting(containerEl).setName(this.t("heading_main")).setHeading();
+    new Setting(containerEl).setName(this.plugin.t("heading_main")).setHeading();
 
     new Setting(containerEl)
-      .setName(this.t("azure_client_id"))
-      .setDesc(this.t("azure_client_desc"))
+      .setName(this.plugin.t("azure_client_id"))
+      .setDesc(this.plugin.t("azure_client_desc"))
       .addText(text =>
         text
           .setPlaceholder("00000000-0000-0000-0000-000000000000")
@@ -2225,8 +2769,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("tenant_id"))
-      .setDesc(this.t("tenant_id_desc"))
+      .setName(this.plugin.t("tenant_id"))
+      .setDesc(this.plugin.t("tenant_id_desc"))
       .addText(text =>
         text
           .setPlaceholder("common")
@@ -2237,61 +2781,61 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           })
       );
 
-    const loginSetting = new Setting(containerEl).setName(this.t("account_status"));
+    const loginSetting = new Setting(containerEl).setName(this.plugin.t("account_status"));
     const statusEl = loginSetting.descEl.createDiv();
     statusEl.setCssProps({ marginTop: "6px" });
     const now = Date.now();
     const tokenValid = Boolean(this.plugin.settings.accessToken) && this.plugin.settings.accessTokenExpiresAt > now + 60_000;
     const canRefresh = Boolean(this.plugin.settings.refreshToken);
     if (tokenValid) {
-      statusEl.setText(this.t("logged_in"));
+      statusEl.setText(this.plugin.t("logged_in"));
     } else if (canRefresh) {
-      statusEl.setText(this.t("authorized_refresh"));
+      statusEl.setText(this.plugin.t("authorized_refresh"));
     } else {
-      statusEl.setText(this.t("not_logged_in"));
+      statusEl.setText(this.plugin.t("not_logged_in"));
     }
 
     const pending = this.plugin.pendingDeviceCode && this.plugin.pendingDeviceCode.expiresAt > Date.now() ? this.plugin.pendingDeviceCode : null;
     if (pending) {
       new Setting(containerEl)
-        .setName(this.t("device_code"))
-        .setDesc(this.t("device_code_desc"))
+        .setName(this.plugin.t("device_code"))
+        .setDesc(this.plugin.t("device_code_desc"))
         .addText(text => {
           text.setValue(pending.userCode);
           text.inputEl.readOnly = true;
         })
         .addButton(btn =>
-          btn.setButtonText(this.t("copy_code")).onClick(async () => {
+          btn.setButtonText(this.plugin.t("copy_code")).onClick(async () => {
             try {
               await navigator.clipboard.writeText(pending.userCode);
-              new Notice(this.t("copied"));
+              new Notice(this.plugin.t("copied"));
             } catch (error) {
               console.error(error);
-              new Notice(this.t("copy_failed"));
+              new Notice(this.plugin.t("copy_failed"));
             }
           })
         )
         .addButton(btn =>
-          btn.setButtonText(this.t("open_login_page")).onClick(() => {
+          btn.setButtonText(this.plugin.t("open_login_page")).onClick(() => {
             try {
               window.open(pending.verificationUri, "_blank");
             } catch (error) {
               console.error(error);
-              new Notice(this.t("cannot_open_browser"));
+              new Notice(this.plugin.t("cannot_open_browser"));
             }
           })
         );
     }
 
     new Setting(containerEl)
-      .setName(this.t("login_logout"))
-      .setDesc(this.t("login_logout_desc"))
+      .setName(this.plugin.t("login_logout"))
+      .setDesc(this.plugin.t("login_logout_desc"))
       .addButton(btn =>
-        btn.setButtonText(this.plugin.isLoggedIn() ? this.t("logout") : this.t("login")).onClick(async () => {
+        btn.setButtonText(this.plugin.isLoggedIn() ? this.plugin.t("logout") : this.plugin.t("login")).onClick(async () => {
           try {
             if (this.plugin.isLoggedIn()) {
               await this.plugin.logout();
-              new Notice(this.t("logged_out"));
+              new Notice(this.plugin.t("logged_out"));
               this.display();
               return;
             }
@@ -2299,7 +2843,7 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
           } catch (error) {
             const message = normalizeErrorMessage(error);
             console.error(error);
-            new Notice(message || this.t("login_failed"));
+            new Notice(message || this.plugin.t("login_failed"));
             this.display();
           }
         })
@@ -2307,11 +2851,11 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
 
 
 
-    new Setting(containerEl).setName(this.t("central_sync_heading")).setHeading();
+    new Setting(containerEl).setName(this.plugin.t("central_sync_heading")).setHeading();
 
     new Setting(containerEl)
-      .setName(this.t("central_sync_path"))
-      .setDesc(this.t("central_sync_path_desc"))
+      .setName(this.plugin.t("central_sync_path"))
+      .setDesc(this.plugin.t("central_sync_path_desc"))
       .addText(text =>
         text
           .setPlaceholder("MicrosoftTodo.md")
@@ -2324,11 +2868,25 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
 
 
 
-    new Setting(containerEl).setName(this.t("task_options_heading")).setHeading();
-
+    // Delete options
     new Setting(containerEl)
-      .setName(this.t("dataview_field"))
-      .setDesc(this.t("dataview_field_desc"))
+        .setName(this.plugin.t("deletion_behavior"))
+        .setDesc(this.plugin.t("deletion_behavior_desc"))
+        .addDropdown(dropdown => dropdown
+            .addOption("complete", this.plugin.t("delete_behavior_complete"))
+            .addOption("delete", this.plugin.t("delete_behavior_delete"))
+            .setValue(this.plugin.settings.deletionBehavior)
+            .onChange(async (value) => {
+                this.plugin.settings.deletionBehavior = value as "complete" | "delete";
+                await this.plugin.saveDataModel();
+            }));
+
+    // Dataview options
+    new Setting(containerEl).setName(this.plugin.t("dataview_options")).setHeading();
+    
+    new Setting(containerEl)
+      .setName(this.plugin.t("dataview_field"))
+      .setDesc(this.plugin.t("dataview_field_desc"))
       .addText(text =>
         text
           .setPlaceholder("MTD")
@@ -2340,8 +2898,37 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("append_tag"))
-      .setDesc(this.t("append_tag_desc"))
+        .setName(this.plugin.t("filter_completed"))
+        .setDesc(this.plugin.t("filter_completed_desc"))
+        .addToggle(toggle => toggle
+            .setValue(this.plugin.settings.dataviewFilterCompleted)
+            .onChange(async (value) => {
+                this.plugin.settings.dataviewFilterCompleted = value;
+                await this.plugin.saveDataModel();
+                
+                // Trigger update of all bound files to refresh Dataview blocks
+                new Notice("Updating Dataview blocks in bound files...");
+                await this.plugin.syncAllBoundFiles();
+                
+                this.display(); // Refresh to show/hide message setting
+            }));
+
+    if (this.plugin.settings.dataviewFilterCompleted) {
+        new Setting(containerEl)
+            .setName(this.plugin.t("completed_message"))
+            .setDesc(this.plugin.t("completed_message_desc"))
+            .addText(text => text
+                .setPlaceholder("🎉 恭喜你完成了所有任务！")
+                .setValue(this.plugin.settings.dataviewCompletedMessage)
+                .onChange(async (value) => {
+                    this.plugin.settings.dataviewCompletedMessage = value;
+                    await this.plugin.saveDataModel();
+                }));
+    }
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("append_tag"))
+      .setDesc(this.plugin.t("append_tag_desc"))
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.pullAppendTagEnabled).onChange(async value => {
           this.plugin.settings.pullAppendTagEnabled = value;
@@ -2350,8 +2937,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("pull_tag_name"))
-      .setDesc(this.t("pull_tag_name_desc"))
+      .setName(this.plugin.t("pull_tag_name"))
+      .setDesc(this.plugin.t("pull_tag_name_desc"))
       .addText(text =>
         text.setPlaceholder(DEFAULT_SETTINGS.pullAppendTag).setValue(this.plugin.settings.pullAppendTag).onChange(async value => {
           this.plugin.settings.pullAppendTag = value.trim() || DEFAULT_SETTINGS.pullAppendTag;
@@ -2360,12 +2947,12 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("pull_tag_type"))
-      .setDesc(this.t("pull_tag_type_desc"))
+      .setName(this.plugin.t("pull_tag_type"))
+      .setDesc(this.plugin.t("pull_tag_type_desc"))
       .addDropdown(dropdown =>
         dropdown
-          .addOption("tag", this.t("pull_tag_type_tag"))
-          .addOption("text", this.t("pull_tag_type_text"))
+          .addOption("tag", this.plugin.t("pull_tag_type_tag"))
+          .addOption("text", this.plugin.t("pull_tag_type_text"))
           .setValue(this.plugin.settings.pullAppendTagType || "tag")
           .onChange(async value => {
             this.plugin.settings.pullAppendTagType = value as "tag" | "text";
@@ -2374,8 +2961,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("append_list_to_tag"))
-      .setDesc(this.t("append_list_to_tag_desc"))
+      .setName(this.plugin.t("append_list_to_tag"))
+      .setDesc(this.plugin.t("append_list_to_tag_desc"))
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.appendListToTag).onChange(async value => {
             this.plugin.settings.appendListToTag = value;
@@ -2383,9 +2970,81 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl).setName(this.plugin.t("tag_binding_heading") || "Tag Binding").setHeading();
     new Setting(containerEl)
-      .setName(this.t("auto_sync"))
-      .setDesc(this.t("auto_sync_desc"))
+        .setName(this.plugin.t("tag_mappings") || "Tag Mappings")
+        .setDesc(this.plugin.t("tag_mappings_desc") || "Map specific tags to Microsoft To Do lists. Tasks with these tags will be synced to the mapped list.")
+        .addButton(btn => btn
+            .setButtonText(this.plugin.t("add_mapping") || "Add Mapping")
+            .onClick(async () => {
+                if (this.plugin.todoListsCache.length === 0) {
+                     try {
+                         const lists = await this.plugin.graph.listTodoLists();
+                         this.plugin.todoListsCache = lists;
+                     } catch (e) {
+                         new Notice("Failed to fetch lists. Please ensure you are logged in.");
+                         return;
+                     }
+                }
+                
+                new TagMappingModal(this.app, this.plugin, async (tag, list) => {
+                    const normalizedTag = tag.startsWith("#") ? tag : `#${tag}`;
+                    // Remove existing if duplicate
+                    this.plugin.settings.tagToTaskMappings = this.plugin.settings.tagToTaskMappings.filter(m => m.tag !== normalizedTag);
+                    
+                    this.plugin.settings.tagToTaskMappings.push({
+                        tag: normalizedTag,
+                        listId: list.id,
+                        listName: list.displayName
+                    });
+                    await this.plugin.saveDataModel();
+                    
+                    // Trigger global scan/update
+                    new Notice("Tag mapping added. Scanning files to update tasks...");
+                    await this.plugin.scanAndSyncTaggedTasks();
+                    
+                    this.display();
+                }).open();
+            }));
+
+    if (this.plugin.settings.tagToTaskMappings && this.plugin.settings.tagToTaskMappings.length > 0) {
+        new Setting(containerEl)
+            .setName(this.plugin.t("scan_sync_tagged") || "Scan & Sync Tagged Tasks")
+            .setDesc(this.plugin.t("scan_sync_tagged_desc") || "Scan all files for tasks with mapped tags. Create new tasks or move existing ones to the correct list.")
+            .addButton(btn => btn
+                .setButtonText(this.plugin.t("scan_now") || "Scan Now")
+                .setCta()
+                .onClick(async () => {
+                    await this.plugin.scanAndSyncTaggedTasks();
+                }));
+
+        const mappingContainer = containerEl.createDiv();
+        this.plugin.settings.tagToTaskMappings.forEach((mapping, index) => {
+            new Setting(mappingContainer)
+                .setName(mapping.tag)
+                .setDesc(`Mapped to: ${mapping.listName}`)
+                .addButton(btn => btn
+                    .setIcon("trash")
+                    .setTooltip("Remove")
+                    .onClick(async () => {
+                        this.plugin.settings.tagToTaskMappings.splice(index, 1);
+                        await this.plugin.saveDataModel();
+                        
+                        // Trigger global update? 
+                        // Maybe just removing mapping doesn't need to move tasks back, 
+                        // but adding should definitely trigger.
+                        // But user might want to re-sync.
+                        new Notice("Mapping removed. Tasks will retain their current list until modified.");
+                        
+                        this.display();
+                    }));
+        });
+    }
+
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("auto_sync"))
+      .setDesc(this.plugin.t("auto_sync_desc"))
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.autoSyncEnabled).onChange(async value => {
           this.plugin.settings.autoSyncEnabled = value;
@@ -2395,8 +3054,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(this.t("auto_sync_interval"))
-      .setDesc(this.t("auto_sync_interval_desc"))
+      .setName(this.plugin.t("auto_sync_interval"))
+      .setDesc(this.plugin.t("auto_sync_interval_desc"))
       .addText(text =>
         text.setValue(String(this.plugin.settings.autoSyncIntervalMinutes)).onChange(async value => {
           const num = Number.parseInt(value, 10);
@@ -2406,25 +3065,25 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl).setName(this.t("file_binding_heading")).setHeading();
+    new Setting(containerEl).setName(this.plugin.t("file_binding_heading")).setHeading();
 
     const activeFile = this.app.workspace.getActiveFile();
     const bindingInfo = activeFile 
         ? (this.app.metadataCache.getFileCache(activeFile)?.frontmatter?.["microsoft-todo-list"] 
-            ? `${this.t("bound_to")} ${this.app.metadataCache.getFileCache(activeFile)?.frontmatter?.["microsoft-todo-list"]}` 
-            : `${this.t("not_bound")} (${activeFile.basename})`)
-        : this.t("no_active_file");
+            ? `${this.plugin.t("bound_to")} ${this.app.metadataCache.getFileCache(activeFile)?.frontmatter?.["microsoft-todo-list"]}` 
+            : `${this.plugin.t("not_bound")} (${activeFile.basename})`)
+        : this.plugin.t("no_active_file");
 
     new Setting(containerEl)
-        .setName(this.t("current_file_binding"))
+        .setName(this.plugin.t("current_file_binding"))
         .setDesc(bindingInfo)
         .addButton(btn => btn
-            .setButtonText(this.t("refresh"))
+            .setButtonText(this.plugin.t("refresh"))
             .onClick(() => this.display()));
 
     new Setting(containerEl)
-        .setName(this.t("sync_header"))
-        .setDesc(this.t("sync_header_desc"))
+        .setName(this.plugin.t("sync_header"))
+        .setDesc(this.plugin.t("sync_header_desc"))
         .addToggle(toggle => toggle
             .setValue(this.plugin.settings.syncHeaderEnabled)
             .onChange(async (value) => {
@@ -2433,8 +3092,8 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
             }));
 
     new Setting(containerEl)
-        .setName(this.t("sync_header_level"))
-        .setDesc(this.t("sync_header_level_desc"))
+        .setName(this.plugin.t("sync_header_level"))
+        .setDesc(this.plugin.t("sync_header_level_desc"))
         .addSlider(slider => slider
             .setLimits(1, 6, 1)
             .setValue(this.plugin.settings.syncHeaderLevel)
@@ -2445,12 +3104,12 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
             }));
 
     new Setting(containerEl)
-        .setName(this.t("sync_direction"))
-        .setDesc(this.t("sync_direction_desc"))
+        .setName(this.plugin.t("sync_direction"))
+        .setDesc(this.plugin.t("sync_direction_desc"))
         .addDropdown(dropdown => dropdown
-            .addOption("top", this.t("sync_direction_top"))
-            .addOption("bottom", this.t("sync_direction_bottom"))
-            .addOption("cursor", this.t("sync_direction_cursor"))
+            .addOption("top", this.plugin.t("sync_direction_top"))
+            .addOption("bottom", this.plugin.t("sync_direction_bottom"))
+            .addOption("cursor", this.plugin.t("sync_direction_cursor"))
             .setValue(this.plugin.settings.syncDirection)
             .onChange(async (value) => {
                 this.plugin.settings.syncDirection = value as "top" | "bottom" | "cursor";
@@ -2465,7 +3124,7 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
 
     if (boundFiles.length > 0) {
         new Setting(containerEl)
-            .setName(this.t("bound_files_list"))
+            .setName(this.plugin.t("bound_files_list"))
             .setHeading();
         
         const listContainer = containerEl.createDiv();
@@ -2473,30 +3132,31 @@ class MicrosoftToDoSettingTab extends PluginSettingTab {
         for (const file of boundFiles) {
             const listName = this.app.metadataCache.getFileCache(file)?.frontmatter?.["microsoft-todo-list"];
             new Setting(listContainer)
-                .setName(file.basename)
-                .setDesc(`${this.t("bound_to")} ${listName}`)
+                .setName(file.path)
+                .setDesc(`${this.plugin.t("bound_to")} ${listName}`)
                 .addButton(btn => btn
-                    .setButtonText(this.t("open"))
+                    .setButtonText(this.plugin.t("open"))
                     .onClick(() => {
                         this.app.workspace.getLeaf().openFile(file);
                     }));
         }
     }
 
+    // Setting Tab UI
     new Setting(containerEl)
-        .setName("Manual Full Sync")
-        .setDesc("Force a full read of the central file and sync to Graph (useful for debugging)")
-        .addButton(btn => btn
-            .setButtonText("Sync Now")
-            .onClick(async () => {
-                new Notice("Starting full manual sync...");
-                await this.plugin.syncToCentralFile();
-            }));
+      .setName(this.plugin.t("manual_full_sync") || "Manual Full Sync")
+      .setDesc(this.plugin.t("manual_full_sync_desc") || "Force a full read of the central file and sync to Graph (useful for debugging)")
+      .addButton(btn => btn
+          .setButtonText(this.plugin.t("sync_now") || "Sync Now")
+          .onClick(async () => {
+              new Notice("Starting full manual sync...");
+              await this.plugin.syncToCentralFile();
+          }));
 
-    new Setting(containerEl).setName("Debug").setHeading();
+    new Setting(containerEl).setName(this.plugin.t("debug_heading") || "Debug").setHeading();
     new Setting(containerEl)
-        .setName("Enable Debug Logging")
-        .setDesc("Output detailed logs to the developer console (Ctrl+Shift+I)")
+        .setName(this.plugin.t("enable_debug_logging") || "Enable Debug Logging")
+        .setDesc(this.plugin.t("enable_debug_logging_desc") || "Output detailed logs to the developer console (Ctrl+Shift+I)")
         .addToggle(toggle => toggle
             .setValue(this.plugin.settings.debugLogging)
             .onChange(async (value) => {
