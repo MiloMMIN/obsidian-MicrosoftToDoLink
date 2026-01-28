@@ -1,4 +1,6 @@
 import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, Setting, TFile, requestUrl } from "obsidian";
+import { Decoration, ViewPlugin, ViewUpdate, EditorView } from "@codemirror/view";
+import { RangeSetBuilder } from "@codemirror/state";
 
 type DeviceCodeResponse = {
   device_code: string;
@@ -58,6 +60,7 @@ type GraphChecklistItem = {
 
 type DeletionPolicy = "complete" | "delete" | "detach";
 type PullInsertLocation = "cursor" | "top" | "bottom" | "existing_group";
+type SyncMarkerFormat = "html" | "obsidian" | "caret";
 
 interface MicrosoftToDoSettings {
   clientId: string;
@@ -77,6 +80,8 @@ interface MicrosoftToDoSettings {
   pullAppendTag: string;
   // Feature flag for auto-populating frontmatter
   autoPopulateFrontmatter: boolean;
+  // Sync marker format: html (<!-- mtd:id -->), obsidian (%% mtd:id %%), or caret (^mtd_id)
+  syncMarkerFormat: SyncMarkerFormat;
 }
 
 interface FileSyncConfig {
@@ -127,7 +132,8 @@ const DEFAULT_SETTINGS: MicrosoftToDoSettings = {
   pullInsertLocation: "bottom",
   pullAppendTagEnabled: false,
   pullAppendTag: "MicrosoftTodo",
-  autoPopulateFrontmatter: false
+  autoPopulateFrontmatter: false,
+  syncMarkerFormat: "html"
 };
 
 const BLOCK_ID_PREFIX = "mtd_";
@@ -421,6 +427,10 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
     this.statusBarItem = this.addStatusBarItem();
     this.updateStatusBar("idle");
+    
+    // Register editor extension to hide sync markers
+    this.registerEditorExtension(createSyncMarkerHiderExtension());
+    this.installSyncMarkerHiderStyles();
 
     this.registerEvent(
       this.app.metadataCache.on("changed", async (file) => {
@@ -938,16 +948,15 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const listMap = new Map(allLists.map(l => [l.id, l.displayName]));
 
       for (const listId of listIds) {
-        // If multiple lists, append specific tag
         let suffixTag: string | undefined = undefined;
+        let headingText: string | undefined = undefined;
         if (listIds.length > 1) {
           const name = listMap.get(listId) || "List";
-          // Sanitize list name for tag (remove spaces, special chars)
-          const safeName = name.replace(/[\s\W]+/g, "-");
-          suffixTag = `-${safeName}`;
+          suffixTag = this.buildListTagSuffix(name);
+          headingText = this.settings.pullGroupUnderHeading ? this.buildListHeadingText(name) : undefined;
         }
 
-        const added = await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+        const added = await this.pullTodoTasksIntoFile(file, listId, false, suffixTag, headingText);
         const childAdded = await this.pullChecklistIntoFile(file, listId, suffixTag);
         addedTotal += added;
         childAddedTotal += childAdded;
@@ -1004,12 +1013,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
       for (const listId of listIds) {
         let suffixTag: string | undefined = undefined;
+        let headingText: string | undefined = undefined;
         if (listIds.length > 1) {
           const name = listMap.get(listId) || "List";
-          const safeName = name.replace(/[\s\W]+/g, "-");
-          suffixTag = `-${safeName}`;
+          suffixTag = this.buildListTagSuffix(name);
+          headingText = this.settings.pullGroupUnderHeading ? this.buildListHeadingText(name) : undefined;
         }
-        addedTotal += await this.pullTodoTasksIntoFile(file, listId, true, suffixTag);
+        addedTotal += await this.pullTodoTasksIntoFile(file, listId, true, suffixTag, headingText);
       }
 
       if (addedTotal === 0) {
@@ -1028,7 +1038,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.updateStatusBar("idle");
   }
 
-  private async pullTodoTasksIntoFile(file: TFile, listId: string, syncAfter: boolean, tagSuffix?: string): Promise<number> {
+  private async pullTodoTasksIntoFile(file: TFile, listId: string, syncAfter: boolean, tagSuffix?: string, headingTextOverride?: string): Promise<number> {
     await this.getValidAccessToken();
     const remoteTasks = await this.graph.listTasks(listId, 200, true);
     const existingGraphIds = new Set(Object.values(this.dataModel.taskMappings).map(m => m.graphTaskId));
@@ -1039,19 +1049,12 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
-    const insertAt = this.resolvePullInsertIndex(lines, file);
+    const insertAt = this.resolvePullInsertIndex(lines, file, headingTextOverride);
     
     let tagForPull = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : undefined;
     if (tagSuffix && tagForPull) {
       tagForPull = `${tagForPull}${tagSuffix}`;
     } else if (tagSuffix) {
-      // If base tag is disabled but suffix provided (multi-list), maybe we should use a default base or just the suffix?
-      // User requirement: "MTD-LIST1". Assuming MTD is base.
-      // If base tag disabled, we probably shouldn't add tags at all OR we should only add the suffix part if critical.
-      // Let's assume if multi-list is active, we force the tag format MTD-Listname.
-      // So we fallback to default base tag if user disabled it? Or just use suffix.
-      // User said "比如原本MTD，现在绑定两个就是MTD-LIST1".
-      // So we use base tag (or default) + suffix.
       const base = this.settings.pullAppendTagEnabled ? this.settings.pullAppendTag : "MicrosoftTodo";
       tagForPull = `${base}${tagSuffix}`;
     }
@@ -1067,7 +1070,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (!title) continue;
       const completed = graphStatusToCompleted(task.status);
       const blockId = `${BLOCK_ID_PREFIX}${randomId(8)}`;
-      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, tagForPull)} ${buildSyncMarker(blockId)}`;
+      const line = `- [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, tagForPull)} ${buildSyncMarker(blockId, this.settings.syncMarkerFormat)}`;
       insertLines.push(line);
 
       const mappingKey = buildMappingKey(file.path, blockId);
@@ -1092,7 +1095,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
           const displayName = sanitizeTitleForGraph((item.displayName || "").trim());
           if (!displayName) continue;
           const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-          const childLine = `  - [${item.isChecked ? "x" : " "}] ${buildMarkdownTaskText(displayName, undefined, tagForPull)} ${buildSyncMarker(childBlockId)}`;
+          const childLine = `  - [${item.isChecked ? "x" : " "}] ${buildMarkdownTaskText(displayName, undefined, tagForPull)} ${buildSyncMarker(childBlockId, this.settings.syncMarkerFormat)}`;
           insertLines.push(childLine);
           const childKey = buildMappingKey(file.path, childBlockId);
           const childLocalHash = hashChecklist(displayName, item.isChecked);
@@ -1146,7 +1149,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     // But check below, the tagForPull is only used when creating NEW child items from Remote
     
     let changed = false;
-    const ensured = ensureBlockIds(lines, tasks);
+    const ensured = ensureBlockIds(lines, tasks, this.settings.syncMarkerFormat);
     if (ensured.changed) {
       changed = true;
       tasks = ensured.tasks;
@@ -1239,7 +1242,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         if (!name) continue;
         if (localChildTitles.has(name)) continue;
         const childBlockId = `${CHECKLIST_BLOCK_ID_PREFIX}${randomId(8)}`;
-        toInsert.push(`  - [ ] ${buildMarkdownTaskText(name, undefined, tagForPull)} ${buildSyncMarker(childBlockId)}`);
+        toInsert.push(`  - [ ] ${buildMarkdownTaskText(name, undefined, tagForPull)} ${buildSyncMarker(childBlockId, this.settings.syncMarkerFormat)}`);
         const ck = buildMappingKey(file.path, childBlockId);
         this.dataModel.checklistMappings[ck] = {
           listId: parentEntry.listId,
@@ -1321,12 +1324,13 @@ class MicrosoftToDoLinkPlugin extends Plugin {
 
         for (const listId of listIds) {
           let suffixTag: string | undefined = undefined;
+          let headingText: string | undefined = undefined;
           if (listIds.length > 1) {
             const name = listMap.get(listId) || "List";
-            const safeName = name.replace(/[\s\W]+/g, "-");
-            suffixTag = `-${safeName}`;
+            suffixTag = this.buildListTagSuffix(name);
+            headingText = this.settings.pullGroupUnderHeading ? this.buildListHeadingText(name) : undefined;
           }
-          pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false, suffixTag);
+          pulledTasks += await this.pullTodoTasksIntoFile(file, listId, false, suffixTag, headingText);
           pulledSubtasks += await this.pullChecklistIntoFile(file, listId, suffixTag);
         }
         await this.syncFileTwoWay(file);
@@ -1365,8 +1369,27 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     // Auto-populate frontmatter if needed
     await this.ensureFrontmatterSynced(file, listIds);
     
-    // We treat the FIRST list as the "default" for new tasks if no mapping exists
     const defaultListId = listIds[0];
+    const listNameById = new Map<string, string>();
+    if (this.todoListsCache.length > 0) {
+      for (const id of listIds) {
+        const name = this.todoListsCache.find(l => l.id === id)?.displayName;
+        if (name) listNameById.set(id, name);
+      }
+    }
+    const tagBases = this.getPullTagNamesToPreserve();
+    const listTagToId = new Map<string, string>();
+    for (const [id, name] of listNameById) {
+      const suffix = this.buildListTagSuffix(name);
+      if (!suffix) continue;
+      for (const base of tagBases) {
+        listTagToId.set(`#${base}${suffix}`, id);
+      }
+    }
+    for (const base of tagBases) {
+      const tag = `#${base}`;
+      if (!listTagToId.has(tag)) listTagToId.set(tag, defaultListId);
+    }
 
     let content = await this.app.vault.read(file);
     const lines = content.split(/\r?\n/);
@@ -1447,7 +1470,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     }
 
     let changed = false;
-    const ensured = ensureBlockIds(lines, tasks);
+    const ensured = ensureBlockIds(lines, tasks, this.settings.syncMarkerFormat);
     if (ensured.changed) {
       changed = true;
       tasks = ensured.tasks;
@@ -1487,11 +1510,12 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         const parentMappingKey = buildMappingKey(file.path, parentTask.blockId);
         let parentEntry = this.dataModel.taskMappings[parentMappingKey];
         if (!parentEntry) {
-          const createdParent = await this.graph.createTask(defaultListId, parentTask.title, parentTask.completed, parentTask.dueDate);
+          const parentListId = this.resolveListIdForTask(parentTask, listTagToId, defaultListId);
+          const createdParent = await this.graph.createTask(parentListId, parentTask.title, parentTask.completed, parentTask.dueDate);
           const graphHash = hashGraphTask(createdParent);
           const localHash = hashTask(parentTask.title, parentTask.completed, parentTask.dueDate);
           parentEntry = {
-            listId: defaultListId,
+            listId: parentListId,
             graphTaskId: createdParent.id,
             lastSyncedAt: Date.now(),
             lastSyncedLocalHash: localHash,
@@ -1571,7 +1595,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         }
 
         if (!localChanged && graphChanged) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} ${buildSyncMarker(task.blockId)}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} ${buildSyncMarker(task.blockId, this.settings.syncMarkerFormat)}`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -1591,7 +1615,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         const graphTime = remote.lastModifiedDateTime ? Date.parse(remote.lastModifiedDateTime) : 0;
         const localTime = fileMtime;
         if (graphTime > localTime) {
-          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} ${buildSyncMarker(task.blockId)}`;
+          const updatedLine = `${task.indent}${task.bullet} [${remote.isChecked ? "x" : " "}] ${buildMarkdownTaskText(remote.displayName, undefined, task.mtdTag)} ${buildSyncMarker(task.blockId, this.settings.syncMarkerFormat)}`;
           if (lines[task.lineIndex] !== updatedLine) {
             lines[task.lineIndex] = updatedLine;
             changed = true;
@@ -1625,10 +1649,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const localHash = hashTask(task.title, task.completed, task.dueDate);
 
       if (!existing) {
-        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
+        const targetListId = this.resolveListIdForTask(task, listTagToId, defaultListId);
+        const created = await this.graph.createTask(targetListId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId: defaultListId,
+          listId: targetListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1645,10 +1670,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const remote = await this.graph.getTask(existing.listId, existing.graphTaskId);
       if (!remote) {
         delete this.dataModel.taskMappings[mappingKey];
-        const created = await this.graph.createTask(defaultListId, task.title, task.completed, task.dueDate);
+        const targetListId = this.resolveListIdForTask(task, listTagToId, defaultListId);
+        const created = await this.graph.createTask(targetListId, task.title, task.completed, task.dueDate);
         const graphHash = hashGraphTask(created);
         this.dataModel.taskMappings[mappingKey] = {
-          listId: defaultListId,
+          listId: targetListId,
           graphTaskId: created.id,
           lastSyncedAt: Date.now(),
           lastSyncedLocalHash: localHash,
@@ -1687,7 +1713,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (!localChanged && graphChanged) {
         const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
         const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
-        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate, this.settings.syncMarkerFormat);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
@@ -1710,7 +1736,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       if (graphTime > localTime) {
         const remoteParts = extractDueFromMarkdownTitle((remote.title || "").trim());
         const remoteDueDate = extractDueDateFromGraphTask(remote) || remoteParts.dueDate;
-        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate);
+        const updatedLine = formatTaskLine(task, remoteParts.title, graphStatusToCompleted(remote.status), remoteDueDate, this.settings.syncMarkerFormat);
         if (lines[task.lineIndex] !== updatedLine) {
           lines[task.lineIndex] = updatedLine;
           changed = true;
@@ -1880,6 +1906,25 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     return Array.from(new Set(tags));
   }
 
+  private buildListTagSuffix(listName: string): string | undefined {
+    const safeName = (listName || "").replace(/[\s\W]+/g, "-").replace(/^-+|-+$/g, "");
+    if (!safeName) return undefined;
+    return `-${safeName}`;
+  }
+
+  private buildListHeadingText(listName: string): string {
+    const base = (this.settings.pullHeadingText || DEFAULT_SETTINGS.pullHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
+    return `${base} - ${listName}`;
+  }
+
+  private resolveListIdForTask(task: ParsedTaskLine, listTagToId: Map<string, string>, defaultListId: string): string {
+    if (task.mtdTag) {
+      const mapped = listTagToId.get(task.mtdTag);
+      if (mapped) return mapped;
+    }
+    return defaultListId;
+  }
+
   private findFrontMatterEnd(lines: string[]): number {
     if ((lines[0] || "").trim() !== "---") return 0;
     for (let i = 1; i < lines.length; i++) {
@@ -1900,7 +1945,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     if (candidateLines.length === 0) return -1;
     if (candidateLines.length === 1) return candidateLines[0];
 
-    const markerPattern = /<!--\s*(?:mtd|MicrosoftToDoSync)\s*:/i;
+    const markerPattern = /(?:<!--\s*(?:mtd|MicrosoftToDoSync)\s*:|%%\s*(?:mtd|MicrosoftToDoSync)\s*:|\^mtdc?_[a-z0-9_]+)/i;
     const sectionEndOf = (headingLine: number): number => {
       const nextHeading = /^(#{1,6})\s+/;
       for (let i = headingLine + 1; i < lines.length; i++) {
@@ -1941,7 +1986,7 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     return lines.length;
   }
 
-  private resolvePullInsertIndex(lines: string[], file: TFile): number {
+  private resolvePullInsertIndex(lines: string[], file: TFile, headingTextOverride?: string): number {
     const location = this.settings.pullInsertLocation || "bottom";
 
     if (!this.settings.pullGroupUnderHeading) {
@@ -1963,10 +2008,21 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       return index;
     }
 
-    const headingText = (this.settings.pullHeadingText || DEFAULT_SETTINGS.pullHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
+    const baseHeadingText = (this.settings.pullHeadingText || DEFAULT_SETTINGS.pullHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
+    const headingText = (headingTextOverride || baseHeadingText).trim() || DEFAULT_SETTINGS.pullHeadingText;
     const headingLevel = Math.min(6, Math.max(1, Math.floor(this.settings.pullHeadingLevel || DEFAULT_SETTINGS.pullHeadingLevel)));
 
     let headingLine = this.findPullHeadingLine(lines, headingText, headingLevel);
+    if (headingLine < 0) {
+      if (headingTextOverride && headingText !== baseHeadingText) {
+        const baseLine = this.findPullHeadingLine(lines, baseHeadingText, headingLevel);
+        if (baseLine >= 0) {
+          lines[baseLine] = `${"#".repeat(headingLevel)} ${headingText}`;
+          headingLine = baseLine;
+        }
+      }
+    }
+
     if (headingLine < 0) {
       const creationLocation: PullInsertLocation = location === "existing_group" ? "bottom" : location;
       let insertAt = this.resolveBaseInsertIndex(lines, file, creationLocation);
@@ -2025,6 +2081,17 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       const modal = new ListSelectModal(this.app, lists, selectedId, resolve);
       modal.open();
     });
+  }
+
+  private installSyncMarkerHiderStyles() {
+    const style = document.createElement("style");
+    style.setAttribute("data-mtd-sync-marker-hider", "1");
+    style.textContent = `
+.cm-content .mtd-sync-marker { display: none !important; }
+.markdown-source-view .mtd-sync-marker { display: none !important; }
+`.trim();
+    document.head.appendChild(style);
+    this.register(() => style.remove());
   }
 }
 
@@ -2140,17 +2207,59 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const SYNC_MARKER_NAME = "MicrosoftToDoSync";
+const SYNC_MARKER_NAME = "mtd";
 
-function buildSyncMarker(blockId: string): string {
+function buildSyncMarker(blockId: string, format?: SyncMarkerFormat): string {
+  if (format === "caret") return `^${blockId}`;
+  if (format === "obsidian") return `%%${SYNC_MARKER_NAME}:${blockId}%%`;
   return `<!-- ${SYNC_MARKER_NAME}:${blockId} -->`;
+}
+
+function createSyncMarkerHiderExtension() {
+  const markerPattern = /(?:<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*-->|%%\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*%%|\^mtdc?_[a-z0-9_]+)/gi;
+  const deco = Decoration.mark({ class: "mtd-sync-marker" });
+  
+  const build = (view: EditorView) => {
+    const builder = new RangeSetBuilder<Decoration>();
+    for (const { from, to } of view.visibleRanges) {
+      const text = view.state.doc.sliceString(from, to);
+      markerPattern.lastIndex = 0;
+      let match;
+      while ((match = markerPattern.exec(text))) {
+        const start = from + match.index;
+        const end = start + match[0].length;
+        builder.add(start, end, deco);
+      }
+    }
+    return builder.finish();
+  };
+
+  return ViewPlugin.fromClass(
+    class {
+      decorations;
+      
+      constructor(view: EditorView) {
+        this.decorations = build(view);
+      }
+      
+      update(update: ViewUpdate) {
+        if (update.docChanged || update.viewportChanged) {
+          this.decorations = build(update.view);
+        }
+      }
+    },
+    {
+      decorations: (v) => v.decorations,
+    }
+  );
 }
 
 function parseMarkdownTasks(lines: string[], tagNamesToPreserve: string[] = []): ParsedTaskLine[] {
   const tasks: ParsedTaskLine[] = [];
   const taskPattern = /^(\s*)([-*])\s+\[([ xX])\]\s+(.*)$/;
   const blockIdCaretPattern = /\s+\^([a-z0-9_]+)\s*$/i;
-  const blockIdCommentPattern = /\s*<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
+  const blockIdHtmlCommentPattern = /\s*<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*([a-z0-9_]+)\s*-->\s*$/i;
+  const blockIdObsidianCommentPattern = /\s*%%\s*(?:mtd|MicrosoftToDoSync)\s*:\s*([a-z0-9_]+)\s*%%\s*$/i;
   const normalizedTags = Array.from(
     new Set(
       tagNamesToPreserve
@@ -2159,10 +2268,11 @@ function parseMarkdownTasks(lines: string[], tagNamesToPreserve: string[] = []):
         .map(t => (t.startsWith("#") ? t.slice(1) : t))
     )
   );
-  const tagRegex =
+  const tagPattern =
     normalizedTags.length > 0
-      ? new RegExp(String.raw`(?:^|\s)#(${normalizedTags.map(escapeRegExp).join("|")})(?=\s*$)`)
-      : null;
+      ? normalizedTags.map(tag => `${escapeRegExp(tag)}(?:-[A-Za-z0-9_-]+)?`).join("|")
+      : "";
+  const tagRegex = tagPattern ? new RegExp(String.raw`(?:^|\s)#(${tagPattern})(?=\s*$)`) : null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = taskPattern.exec(line);
@@ -2173,9 +2283,10 @@ function parseMarkdownTasks(lines: string[], tagNamesToPreserve: string[] = []):
     const rest = (match[4] ?? "").trim();
     if (!rest) continue;
 
-    const commentMatch = blockIdCommentPattern.exec(rest);
-    const caretMatch = commentMatch ? null : blockIdCaretPattern.exec(rest);
-    const markerMatch = commentMatch || caretMatch;
+    const htmlCommentMatch = blockIdHtmlCommentPattern.exec(rest);
+    const obsidianCommentMatch = htmlCommentMatch ? null : blockIdObsidianCommentPattern.exec(rest);
+    const caretMatch = (htmlCommentMatch || obsidianCommentMatch) ? null : blockIdCaretPattern.exec(rest);
+    const markerMatch = htmlCommentMatch || obsidianCommentMatch || caretMatch;
     const existingBlockId = markerMatch ? markerMatch[1] : "";
     const rawTitleWithTag = markerMatch ? rest.slice(0, markerMatch.index).trim() : rest;
     if (!rawTitleWithTag) continue;
@@ -2205,7 +2316,7 @@ function parseMarkdownTasks(lines: string[], tagNamesToPreserve: string[] = []):
   return tasks;
 }
 
-function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: ParsedTaskLine[]; changed: boolean } {
+function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[], format: SyncMarkerFormat = "html"): { tasks: ParsedTaskLine[]; changed: boolean } {
   let changed = false;
   const updated: ParsedTaskLine[] = [];
   const stack: { indentWidth: number }[] = [];
@@ -2215,7 +2326,7 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
     const isNested = stack.length > 0;
 
     if (task.blockId) {
-      const normalized = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} ${buildSyncMarker(task.blockId)}`;
+      const normalized = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} ${buildSyncMarker(task.blockId, format)}`;
       if (lines[task.lineIndex] !== normalized) {
         lines[task.lineIndex] = normalized;
         changed = true;
@@ -2227,7 +2338,7 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
 
     const prefix = isNested ? CHECKLIST_BLOCK_ID_PREFIX : BLOCK_ID_PREFIX;
     const newBlockId = `${prefix}${randomId(8)}`;
-    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} ${buildSyncMarker(newBlockId)}`;
+    const newLine = `${task.indent}${task.bullet} [${task.completed ? "x" : " "}] ${buildMarkdownTaskText(task.title, task.dueDate, task.mtdTag)} ${buildSyncMarker(newBlockId, format)}`;
     lines[task.lineIndex] = newLine;
     updated.push({ ...task, blockId: newBlockId });
     changed = true;
@@ -2236,8 +2347,8 @@ function ensureBlockIds(lines: string[], tasks: ParsedTaskLine[]): { tasks: Pars
   return { tasks: updated, changed };
 }
 
-function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean, dueDate?: string): string {
-  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, task.mtdTag)} ${buildSyncMarker(task.blockId)}`;
+function formatTaskLine(task: ParsedTaskLine, title: string, completed: boolean, dueDate?: string, format: SyncMarkerFormat = "html"): string {
+  return `${task.indent}${task.bullet} [${completed ? "x" : " "}] ${buildMarkdownTaskText(title, dueDate, task.mtdTag)} ${buildSyncMarker(task.blockId, format)}`;
 }
 
 function randomId(length: number): string {
@@ -2287,6 +2398,7 @@ function sanitizeTitleForGraph(title: string): string {
   const withoutIds = input
     .replace(/\^mtdc?_[a-z0-9_]+/gi, " ")
     .replace(/<!--\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*-->/gi, " ")
+    .replace(/%%\s*(?:mtd|MicrosoftToDoSync)\s*:\s*[a-z0-9_]+\s*%%/gi, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
   return withoutIds;
