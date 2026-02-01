@@ -4,12 +4,18 @@ Two-way sync between Obsidian Markdown tasks and Microsoft To Do (via Microsoft 
 
 ## Features
 
-- Device Code login (no local callback URL required)
-- Two-way sync: Obsidian ↔ Microsoft To Do (title / completion / due date)
-- Due date mapping: Obsidian `📅 YYYY-MM-DD` ↔ To Do `dueDateTime`
-- Subtasks sync: To Do Steps (checklist items) ↔ Obsidian nested tasks
-- Configurable deletion policy when a synced task line is removed locally
-- Pull-only-active: pulls active (not completed) tasks from To Do into the current note
+- **Device Code Login**: Secure and convenient, no local callback URL required.
+- **Two-way Sync**: Obsidian ↔ Microsoft To Do (Title / Completion / Due Date).
+- **Multiple Sync Modes**:
+  - **Central Sync**: Aggregates all tasks into a central file (default `MicrosoftTodoTasks.md`).
+  - **File Binding**: Binds specific notes to specific To Do lists via Frontmatter.
+- **Tag Mapping**: Maps specific tags (e.g., `#Work`) to corresponding lists for automatic classification.
+- **Auto Sync**: Supports sync on startup and scheduled auto-sync.
+- **Subtasks Support**: To Do Steps ↔ Obsidian indented tasks.
+- **Smart Deduplication**: Automatically strips repeated tags and metadata to prevent title accumulation.
+- **Dataview Integration**: Generates Dataview attributes for easy querying and management.
+
+> **Note**: This plugin works best with **Dataview** for metadata display.
 
 ## Installation
 
@@ -82,24 +88,41 @@ After that you should see "Logged in" (or "Consent saved") and you can **Logout*
 
 ## Usage
 
-### 1) Select a list
+### 1. Central Sync (Default)
 
-Pick a default To Do list (and optionally bind a specific list to the current file).
+Aggregates tasks from all lists into a single file.
 
-List resolution order:
+1. Configure **Central Sync File Path** in settings (default: `MicrosoftTodoTasks.md`).
+2. Click the sync icon (🔄) in the ribbon or use command `Sync to Central File`.
+3. Tasks will be generated in the file, grouped by list name.
 
-1. List bound to the current file
-2. Default list in settings
+### 2. File Binding
 
-### 2) One-click sync current file (recommended)
+Bind a specific note to a specific To Do list.
 
-Use the left ribbon sync icon or the settings button "Sync current file".
+**How to use**:
+1. Add `microsoft-todo-list` to Frontmatter:
+   ```yaml
+   ---
+   microsoft-todo-list: "My Tasks"
+   ---
+   ```
+2. Run sync in that file.
+3. Tasks will only sync with the "My Tasks" list.
 
-Sync order:
+**Tip**: Adjust "New Task Insertion Position" in settings (Top/Bottom/Cursor).
 
-1. Pull active tasks from To Do into the current file (includes subtasks & due dates)
-2. Push local changes to To Do (new/update/complete/due date)
-3. If an item is completed in To Do, it will be updated to `- [x]` in Obsidian
+### 3. Tag Mapping
+
+Map Obsidian tags to To Do lists in settings.
+
+- Tasks with mapped tags (e.g., `#MTD-Tweet`) are automatically synced to the corresponding list.
+- Supports bulk editing.
+
+### Modification & Write-back
+
+- Changes to title, completion, or due date in Obsidian are pushed to To Do on next sync.
+- Only tasks with sync markers (`<!-- mtd:id -->`) are updated.
 
 ## Task format
 

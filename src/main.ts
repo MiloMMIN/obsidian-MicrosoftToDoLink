@@ -1873,6 +1873,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
             cleanTitle = cleanTitle.replace(fieldRegex, "").trim();
             cleanTitle = cleanTitle.replace(/\[MTD-任务清单\s*::\s*.*?\]/gi, "").trim();
 
+            if (mappedTag) {
+                const tagRegex = new RegExp(`${escapeRegExp(mappedTag)}`, "gi");
+                cleanTitle = cleanTitle.replace(tagRegex, "").trim();
+            }
+
             if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
                  const rawTag = escapeRegExp(this.settings.pullAppendTag);
                  const tagRegex = new RegExp(`#${rawTag}(?:/[\\w\\u4e00-\\u9fa5\\-_]+)?`, "gi");
