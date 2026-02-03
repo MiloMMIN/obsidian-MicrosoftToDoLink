@@ -782,10 +782,31 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       if (fileContent.startsWith("---")) {
         const firstBlockIndex = fileContent.indexOf("<!-- MTD-START");
         const searchEnd = firstBlockIndex >= 0 ? firstBlockIndex : fileContent.length;
-        const frontmatterPart = fileContent.substring(0, searchEnd);
-        if (frontmatterPart.indexOf("---", 3) === -1) {
+        const secondDashIndex = fileContent.indexOf("---", 3);
+        if (secondDashIndex === -1 || secondDashIndex >= searchEnd) {
           const insertStr = fileContent.substring(0, searchEnd).endsWith("\n") ? "---\n\n" : "\n---\n\n";
           fileContent = fileContent.substring(0, searchEnd) + insertStr + fileContent.substring(searchEnd);
+        } else {
+          const afterDash = fileContent.substring(secondDashIndex + 3);
+          if (afterDash.length > 0 && !afterDash.startsWith("\n") && !afterDash.startsWith("\r")) {
+            fileContent = fileContent.substring(0, secondDashIndex + 3) + "\n\n" + afterDash;
+          }
+        }
+      }
+      if (fileContent.startsWith("---")) {
+        const secondDashIndex = fileContent.indexOf("---", 3);
+        if (secondDashIndex !== -1) {
+          const validFmEnd = secondDashIndex + 3;
+          let restOfFile = fileContent.substring(validFmEnd);
+          const duplicateBlockRegex = /\n---\s*[\r\n]+[\s\S]*?microsoft-todo-list:[\s\S]*?[\r\n]+---\s*/g;
+          if (duplicateBlockRegex.test(restOfFile)) {
+            restOfFile = restOfFile.replace(duplicateBlockRegex, "\n");
+          }
+          const duplicatePropRegex = /(\n|^)\s*microsoft-todo-list:\s*(\n\s*-[^\n]*)+/g;
+          if (duplicatePropRegex.test(restOfFile)) {
+            restOfFile = restOfFile.replace(duplicatePropRegex, "\n");
+          }
+          fileContent = fileContent.substring(0, validFmEnd) + restOfFile;
         }
       }
       const legacyBlockRegex = /<!-- MTD-START: (.*?) -->([\s\S]*?)<!-- MTD-END: \1 -->/g;
@@ -889,12 +910,15 @@ if (tasks.length) {
         } else {
           blockContent = dataviewBlock;
         }
-        const newContent = header + blockContent + "\n";
+        let newContent = header + blockContent + "\n";
         if (legacyBlocks.has(listName)) {
           const info = legacyBlocks.get(listName);
           finalModifications.push({ start: info.start, end: info.end, replacement: newContent });
         } else if (genericBlocks.has(listName)) {
           const info = genericBlocks.get(listName);
+          if (this.settings.syncHeaderEnabled && !info.content.trimStart().startsWith("#")) {
+            newContent = "\n" + newContent;
+          }
           finalModifications.push({ start: info.start, end: info.end, replacement: newContent });
         } else {
           listsToAppend.push(newContent);
@@ -1316,6 +1340,10 @@ ${headerLine}
           const fieldRegex = new RegExp(`\\[${escapeRegExp(fieldName)}\\s*::\\s*.*?\\]`, "gi");
           cleanTitle = cleanTitle.replace(fieldRegex, "").trim();
           cleanTitle = cleanTitle.replace(/\[MTD-任务清单\s*::\s*.*?\]/gi, "").trim();
+          if (mappedTag) {
+            const tagRegex = new RegExp(`${escapeRegExp(mappedTag)}`, "gi");
+            cleanTitle = cleanTitle.replace(tagRegex, "").trim();
+          }
           if (this.settings.pullAppendTagEnabled && this.settings.pullAppendTag) {
             const rawTag = escapeRegExp(this.settings.pullAppendTag);
             const tagRegex = new RegExp(`#${rawTag}(?:/[\\w\\u4e00-\\u9fa5\\-_]+)?`, "gi");
