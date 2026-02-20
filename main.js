@@ -734,13 +734,12 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
         initialSelected = [currentBinding];
       }
       new MultiSelectListModal(this.app, this, initialSelected, async (lists) => {
-        var _a2;
         const listNames = lists.map((l) => l.displayName);
         await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
           frontmatter["microsoft-todo-list"] = listNames;
         });
         new import_obsidian.Notice(`Bound file to lists: ${listNames.join(", ")}`);
-        await this.syncBoundFile(file, (_a2 = this.app.workspace.activeEditor) == null ? void 0 : _a2.editor, listNames);
+        await this.syncBoundFile(file, void 0, listNames);
         this.syncToCentralFile();
       }).open();
     } catch (e) {
@@ -779,36 +778,6 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       }
       this.debug("Starting syncBoundFile", { file: file.path, explicitListNames });
       let fileContent = editor ? editor.getValue() : await this.app.vault.read(file);
-      if (fileContent.startsWith("---")) {
-        const firstBlockIndex = fileContent.indexOf("<!-- MTD-START");
-        const searchEnd = firstBlockIndex >= 0 ? firstBlockIndex : fileContent.length;
-        const secondDashIndex = fileContent.indexOf("---", 3);
-        if (secondDashIndex === -1 || secondDashIndex >= searchEnd) {
-          const insertStr = fileContent.substring(0, searchEnd).endsWith("\n") ? "---\n\n" : "\n---\n\n";
-          fileContent = fileContent.substring(0, searchEnd) + insertStr + fileContent.substring(searchEnd);
-        } else {
-          const afterDash = fileContent.substring(secondDashIndex + 3);
-          if (afterDash.length > 0 && !afterDash.startsWith("\n") && !afterDash.startsWith("\r")) {
-            fileContent = fileContent.substring(0, secondDashIndex + 3) + "\n\n" + afterDash;
-          }
-        }
-      }
-      if (fileContent.startsWith("---")) {
-        const secondDashIndex = fileContent.indexOf("---", 3);
-        if (secondDashIndex !== -1) {
-          const validFmEnd = secondDashIndex + 3;
-          let restOfFile = fileContent.substring(validFmEnd);
-          const duplicateBlockRegex = /\n---\s*[\r\n]+[\s\S]*?microsoft-todo-list:[\s\S]*?[\r\n]+---\s*/g;
-          if (duplicateBlockRegex.test(restOfFile)) {
-            restOfFile = restOfFile.replace(duplicateBlockRegex, "\n");
-          }
-          const duplicatePropRegex = /(\n|^)\s*microsoft-todo-list:\s*(\n\s*-[^\n]*)+/g;
-          if (duplicatePropRegex.test(restOfFile)) {
-            restOfFile = restOfFile.replace(duplicatePropRegex, "\n");
-          }
-          fileContent = fileContent.substring(0, validFmEnd) + restOfFile;
-        }
-      }
       const legacyBlockRegex = /<!-- MTD-START: (.*?) -->([\s\S]*?)<!-- MTD-END: \1 -->/g;
       let match;
       const legacyBlocks = /* @__PURE__ */ new Map();
@@ -931,9 +900,9 @@ if (tasks.length) {
       if (listsToAppend.length > 0) {
         const appendContent = listsToAppend.join("\n");
         if (this.settings.syncDirection === "top") {
-          const fmEnd = fileContent.indexOf("---", 3);
-          if (fileContent.startsWith("---") && fmEnd > 0) {
-            const insertPos = fmEnd + 3;
+          const fmForInsert = parseFrontmatter(fileContent);
+          if (fmForInsert) {
+            const insertPos = fmForInsert.end;
             fileContent = fileContent.slice(0, insertPos) + "\n\n" + appendContent + fileContent.slice(insertPos);
           } else {
             if (fileContent.trim().length === 0) {
@@ -1032,9 +1001,9 @@ if (tasks.length) {
 ${headerLine}
 `;
               if (this.settings.syncDirection === "top") {
-                const fmEnd = centralContent.indexOf("---", 3);
-                if (centralContent.startsWith("---") && fmEnd > 0) {
-                  centralContent = centralContent.slice(0, fmEnd + 3) + "\n\n" + appendContent + centralContent.slice(fmEnd + 3);
+                const cfm = parseFrontmatter(centralContent);
+                if (cfm) {
+                  centralContent = centralContent.slice(0, cfm.end) + "\n\n" + appendContent + centralContent.slice(cfm.end);
                 } else {
                   centralContent = appendContent + centralContent;
                 }
@@ -1645,6 +1614,18 @@ function migrateDataModel(raw) {
 }
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function parseFrontmatter(content) {
+  var _a;
+  const lines = content.split("\n");
+  if (((_a = lines[0]) == null ? void 0 : _a.trimEnd()) !== "---") return null;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trimEnd() === "---") {
+      const end = lines.slice(0, i + 1).join("\n").length;
+      return { end, body: lines.slice(1, i).join("\n") };
+    }
+  }
+  return null;
 }
 var SYNC_MARKER_NAME = "mtd";
 function buildSyncMarker(blockId) {
