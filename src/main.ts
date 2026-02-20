@@ -547,8 +547,18 @@ class MicrosoftToDoLinkPlugin extends Plugin {
     this.registerEditorExtension(createSyncMarkerHiderExtension());
     this.installSyncMarkerHiderStyles();
 
-    this.addRibbonIcon("refresh-cw", "Sync to Central File", async () => {
-      await this.syncToCentralFile();
+    this.addRibbonIcon("refresh-cw", "Sync with Microsoft To Do", async () => {
+      this.updateStatusBar("syncing");
+      try {
+        await this.syncToCentralFile();
+        await this.syncAllBoundFiles();
+      } catch (error) {
+        console.error(error);
+        this.updateStatusBar("error");
+        setTimeout(() => this.updateStatusBar("idle"), 5000);
+        return;
+      }
+      this.updateStatusBar("idle");
     });
 
     this.addCommand({
@@ -1115,6 +1125,23 @@ class MicrosoftToDoLinkPlugin extends Plugin {
       // inserting extra `---` or stripping content with regex was the root cause
       // of the frontmatter rendering bug.
 
+      // Repair corrupted frontmatter: if the closing --- has content stuck to it
+      // (e.g. "---# Header" on one line), split them apart so Obsidian can parse it.
+      if (fileContent.startsWith("---\n") && !parseFrontmatter(fileContent)) {
+        const repairLines = fileContent.split("\n");
+        for (let i = 1; i < repairLines.length; i++) {
+          const line = repairLines[i];
+          if (line.startsWith("---") && line.length > 3 && line[3] !== '\r') {
+            // "---<content>" -> "---" + blank line + "<content>"
+            const rest = line.substring(3);
+            repairLines.splice(i, 1, "---", "", rest);
+            fileContent = repairLines.join("\n");
+            this.debug("Repaired corrupted frontmatter closing", { repairedLine: line });
+            break;
+          }
+        }
+      }
+
       // Find all existing MTD blocks (Legacy with comments)
       const legacyBlockRegex = /<!-- MTD-START: (.*?) -->([\s\S]*?)<!-- MTD-END: \1 -->/g;
       let match;
@@ -1296,10 +1323,11 @@ class MicrosoftToDoLinkPlugin extends Plugin {
         } else if (genericBlocks.has(listName)) {
           const info = genericBlocks.get(listName)!;
 
-          // Fix for accumulated headers bug:
-          // If the regex matched the block but failed to capture the header (e.g. because it was attached to frontmatter like '---# Header'),
-          // we must prepend a newline to ensure the new header is valid and separated.
-          if (this.settings.syncHeaderEnabled && !info.content.trimStart().startsWith("#")) {
+          // Preserve the leading \n that the regex consumed.
+          // The regex header group (?:^|\n) captures the \n that separates
+          // previous content (e.g. frontmatter ---) from this block.
+          // Without preserving it, --- and # Header get concatenated on one line.
+          if (info.content.startsWith("\n")) {
             newContent = "\n" + newContent;
           }
 

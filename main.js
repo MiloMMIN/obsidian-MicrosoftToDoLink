@@ -328,8 +328,18 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
     this.updateStatusBar("idle");
     this.registerEditorExtension(createSyncMarkerHiderExtension());
     this.installSyncMarkerHiderStyles();
-    this.addRibbonIcon("refresh-cw", "Sync to Central File", async () => {
-      await this.syncToCentralFile();
+    this.addRibbonIcon("refresh-cw", "Sync with Microsoft To Do", async () => {
+      this.updateStatusBar("syncing");
+      try {
+        await this.syncToCentralFile();
+        await this.syncAllBoundFiles();
+      } catch (error) {
+        console.error(error);
+        this.updateStatusBar("error");
+        setTimeout(() => this.updateStatusBar("idle"), 5e3);
+        return;
+      }
+      this.updateStatusBar("idle");
     });
     this.addCommand({
       id: "sync-central-file",
@@ -778,6 +788,19 @@ var MicrosoftToDoLinkPlugin = class extends import_obsidian.Plugin {
       }
       this.debug("Starting syncBoundFile", { file: file.path, explicitListNames });
       let fileContent = editor ? editor.getValue() : await this.app.vault.read(file);
+      if (fileContent.startsWith("---\n") && !parseFrontmatter(fileContent)) {
+        const repairLines = fileContent.split("\n");
+        for (let i = 1; i < repairLines.length; i++) {
+          const line = repairLines[i];
+          if (line.startsWith("---") && line.length > 3 && line[3] !== "\r") {
+            const rest = line.substring(3);
+            repairLines.splice(i, 1, "---", "", rest);
+            fileContent = repairLines.join("\n");
+            this.debug("Repaired corrupted frontmatter closing", { repairedLine: line });
+            break;
+          }
+        }
+      }
       const legacyBlockRegex = /<!-- MTD-START: (.*?) -->([\s\S]*?)<!-- MTD-END: \1 -->/g;
       let match;
       const legacyBlocks = /* @__PURE__ */ new Map();
@@ -885,7 +908,7 @@ if (tasks.length) {
           finalModifications.push({ start: info.start, end: info.end, replacement: newContent });
         } else if (genericBlocks.has(listName)) {
           const info = genericBlocks.get(listName);
-          if (this.settings.syncHeaderEnabled && !info.content.trimStart().startsWith("#")) {
+          if (info.content.startsWith("\n")) {
             newContent = "\n" + newContent;
           }
           finalModifications.push({ start: info.start, end: info.end, replacement: newContent });
